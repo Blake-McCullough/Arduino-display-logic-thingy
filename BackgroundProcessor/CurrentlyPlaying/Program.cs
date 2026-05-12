@@ -1,40 +1,58 @@
 ﻿using System;
+using System.IO;
 using System.IO.Ports;
-using System.Threading;
 using System.Threading.Tasks;
 using Windows.Media.Control;
+using Windows.Storage.Streams;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace MusicToArduino
 {
     class Program
     {
         private static SerialPort _serialPort;
-        private static string _lastSong = "";
+        private static string _lastSongKey = "";
+        private static byte[] _lastThumbnail = null;
+        private static DateTime _lastSendTime = DateTime.MinValue;
+        private static TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
 
         static async Task Main(string[] args)
         {
-            // Find available COM ports
-            Console.WriteLine("Available COM ports:");
-            foreach (string port in SerialPort.GetPortNames())
+            Console.WriteLine("╔═══════════════════════════════════════╗");
+            Console.WriteLine("║    Music Player to Arduino Bridge     ║");
+            Console.WriteLine("╚═══════════════════════════════════════╝\n");
+
+            string[] ports = SerialPort.GetPortNames();
+            if (ports.Length == 0)
             {
-                Console.WriteLine($"  {port}");
+                Console.WriteLine("No COM ports found!");
+                Console.ReadKey();
+                return;
             }
 
-            Console.Write("\nEnter COM port (e.g., COM3): ");
+            Console.WriteLine("Available COM ports:");
+            foreach (string port in ports) Console.WriteLine($"  {port}");
+
+            Console.Write("\nEnter COM port: ");
             string comPort = Console.ReadLine();
-
-            Console.Write("Enter baud rate (default 9600): ");
+            Console.Write("Enter baud rate (default 115200): ");
             string baudInput = Console.ReadLine();
-            int baudRate = string.IsNullOrEmpty(baudInput) ? 9600 : int.Parse(baudInput);
+            int baudRate = string.IsNullOrEmpty(baudInput) ? 115200 : int.Parse(baudInput);
 
-            // Setup serial port
-            _serialPort = new SerialPort(comPort, baudRate, Parity.None, 8, StopBits.One);
-            _serialPort.Open();
-            Console.WriteLine($"Connected to {comPort} at {baudRate} baud\n");
-
-            // Start monitoring music
-            Console.WriteLine("Monitoring music... Press Ctrl+C to stop");
-            await MonitorMusic();
+            try
+            {
+                _serialPort = new SerialPort(comPort, baudRate, Parity.None, 8, StopBits.One);
+                _serialPort.Open();
+                Console.WriteLine($"\n✓ Connected to {comPort}\n");
+                await MonitorMusic();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"✗ Error: {ex.Message}");
+                Console.ReadKey();
+            }
         }
 
         static async Task MonitorMusic()
@@ -43,16 +61,19 @@ namespace MusicToArduino
             {
                 try
                 {
-                    string songInfo = await GetCurrentSong();
-
-                    if (!string.IsNullOrEmpty(songInfo) && songInfo != _lastSong)
+                    var songData = await GetCurrentSongData();
+                    if (songData != null)
                     {
-                        _lastSong = songInfo;
-                        SendToArduino(songInfo);
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Sent: {songInfo}");
+                        string currentKey = $"{songData.Title}|{songData.Artist}";
+                        if (currentKey != _lastSongKey && (DateTime.Now - _lastSendTime) >= _minSendInterval)
+                        {
+                            _lastSongKey = currentKey;
+                            _lastSendTime = DateTime.Now;
+                            SendToArduino(songData);
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✓ {songData.Title} - {songData.Artist}");
+                        }
                     }
-
-                    await Task.Delay(2000); // Check every 2 seconds
+                    await Task.Delay(1000);
                 }
                 catch (Exception ex)
                 {
@@ -62,46 +83,169 @@ namespace MusicToArduino
             }
         }
 
-        static async Task<string> GetCurrentSong()
+        static async Task<SongData> GetCurrentSongData()
         {
             try
             {
                 var sessionManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
                 var currentSession = sessionManager.GetCurrentSession();
+                if (currentSession == null) return null;
 
-                if (currentSession != null)
+                var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
+                if (string.IsNullOrWhiteSpace(mediaProperties.Title)) return null;
+
+                var timelineProperties = currentSession.GetTimelineProperties();
+
+                string title = mediaProperties.Title.Replace("|", "").Trim();
+                string artist = (mediaProperties.Artist ?? "Unknown Artist").Replace("|", "").Trim();
+
+                byte[] thumbnailBytes = null;
+
+                // Only process thumbnail for new songs
+                string currentKey = $"{title}|{artist}";
+                if (currentKey != _lastSongKey && mediaProperties.Thumbnail != null)
                 {
-                    var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
-                    var timelineProperties = currentSession.GetTimelineProperties();
-
-                    if (!string.IsNullOrWhiteSpace(mediaProperties.Title))
+                    thumbnailBytes = await GetAndConvertThumbnail(mediaProperties.Thumbnail);
+                    if (thumbnailBytes != null)
                     {
-                        string artist = string.IsNullOrWhiteSpace(mediaProperties.Artist) ? "Unknown" : mediaProperties.Artist;
-                        string title = mediaProperties.Title;
+                        // Save for debugging
+                        File.WriteAllBytes("latest_thumbnail.raw", thumbnailBytes);
+                        Console.WriteLine($"  Thumbnail: {thumbnailBytes.Length} bytes saved to latest_thumbnail.raw");
 
-                        // Format: ARTIST|TITLE|DURATION|POSITION
-                        int duration = (int)timelineProperties.EndTime.TotalSeconds;
-                        int position = (int)timelineProperties.Position.TotalSeconds;
-
-                        // Encode to avoid special characters
-                        return $"{artist}|{title}|{duration}|{position}";
+                        // Verify first few bytes are valid
+                        Console.WriteLine($"  First bytes: {BitConverter.ToString(thumbnailBytes.Take(16).ToArray())}");
                     }
                 }
-                return null;
+
+                return new SongData
+                {
+                    Title = title,
+                    Artist = artist,
+                    Duration = (int)timelineProperties.EndTime.TotalSeconds,
+                    Position = (int)timelineProperties.Position.TotalSeconds,
+                    Thumbnail = thumbnailBytes ?? _lastThumbnail
+                };
             }
-            catch
+            catch (Exception ex)
             {
+                Console.WriteLine($"Error: {ex.Message}");
                 return null;
             }
         }
 
-        static void SendToArduino(string data)
+        static async Task<byte[]> GetAndConvertThumbnail(IRandomAccessStreamReference thumbnailRef)
         {
-            if (_serialPort != null && _serialPort.IsOpen)
+            try
             {
-                // Old school style: send with start/end markers
-                _serialPort.Write($"<{data}>\n");
+                // Open the stream
+                using (var stream = await thumbnailRef.OpenReadAsync())
+                {
+                    Console.WriteLine($"  Stream size: {stream.Size} bytes");
+
+                    // Read raw image bytes
+                    byte[] rawBytes = new byte[stream.Size];
+                    using (var dataReader = new DataReader(stream))
+                    {
+                        await dataReader.LoadAsync((uint)stream.Size);
+                        dataReader.ReadBytes(rawBytes);
+                    }
+
+                    // Save original for debugging
+                    File.WriteAllBytes("original_thumbnail.jpg", rawBytes);
+                    Console.WriteLine($"  Saved original thumbnail ({(rawBytes.Length / 1024)} KB)");
+
+                    // Convert to bitmap
+                    using (var ms = new MemoryStream(rawBytes))
+                    using (var originalImage = Image.FromStream(ms))
+                    {
+                        Console.WriteLine($"  Original size: {originalImage.Width}x{originalImage.Height}");
+
+                        // Create resized 80x80 image
+                        using (var resizedBitmap = new Bitmap(80, 80))
+                        using (var graphics = Graphics.FromImage(resizedBitmap))
+                        {
+                            graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                            graphics.DrawImage(originalImage, 0, 0, 80, 80);
+
+                            // Convert to RGB565
+                            byte[] rgb565 = new byte[80 * 80 * 2];
+
+                            for (int y = 0; y < 80; y++)
+                            {
+                                for (int x = 0; x < 80; x++)
+                                {
+                                    Color pixel = resizedBitmap.GetPixel(x, y);
+
+                                    // RGB565 conversion
+                                    int r = (pixel.R >> 3) & 0x1F;
+                                    int g = (pixel.G >> 2) & 0x3F;
+                                    int b = (pixel.B >> 3) & 0x1F;
+
+                                    ushort rgb565Color = (ushort)((r << 11) | (g << 5) | b);
+
+                                    int index = (y * 80 + x) * 2;
+                                    rgb565[index] = (byte)(rgb565Color & 0xFF);     // Low byte
+                                    rgb565[index + 1] = (byte)((rgb565Color >> 8) & 0xFF); // High byte
+                                }
+                            }
+
+                            // Create a test BMP to verify the resized image
+                            resizedBitmap.Save("resized_thumbnail.bmp", ImageFormat.Bmp);
+                            Console.WriteLine($"  Saved resized thumbnail to resized_thumbnail.bmp");
+
+                            return rgb565;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  Thumbnail conversion failed: {ex.Message}");
+                return null;
             }
         }
+
+        static void SendToArduino(SongData data)
+        {
+            if (_serialPort?.IsOpen != true) return;
+
+            try
+            {
+                // Send header
+                string header = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|";
+                byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
+                _serialPort.Write(headerBytes, 0, headerBytes.Length);
+
+                // Send thumbnail if available
+                if (data.Thumbnail != null && data.Thumbnail.Length == 12800)
+                {
+                    _serialPort.Write(data.Thumbnail, 0, data.Thumbnail.Length);
+                    Console.WriteLine($"  Sent thumbnail: 12800 bytes");
+                }
+                else
+                {
+                    // Send placeholder data (all zeros)
+                    byte[] placeholder = new byte[12800];
+                    _serialPort.Write(placeholder, 0, placeholder.Length);
+                    Console.WriteLine($"  Sent placeholder thumbnail");
+                }
+
+                _serialPort.Write(new byte[] { (byte)'\n' }, 0, 1);
+                _serialPort.BaseStream.Flush();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Send error: {ex.Message}");
+            }
+        }
+    }
+
+    class SongData
+    {
+        public string Title { get; set; }
+        public string Artist { get; set; }
+        public int Duration { get; set; }
+        public int Position { get; set; }
+        public byte[] Thumbnail { get; set; }
     }
 }
