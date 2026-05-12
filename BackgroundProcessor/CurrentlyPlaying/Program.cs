@@ -1,60 +1,106 @@
 ﻿using System;
+using System.IO.Ports;
+using System.Threading;
 using System.Threading.Tasks;
 using Windows.Media.Control;
 
-namespace MusicIdentifier
+namespace MusicToArduino
 {
     class Program
     {
+        private static SerialPort _serialPort;
+        private static string _lastSong = "";
+
         static async Task Main(string[] args)
         {
-            // Get the song info when the program runs
-            await GetNowPlaying();
-            Console.ReadKey();
+            // Find available COM ports
+            Console.WriteLine("Available COM ports:");
+            foreach (string port in SerialPort.GetPortNames())
+            {
+                Console.WriteLine($"  {port}");
+            }
+
+            Console.Write("\nEnter COM port (e.g., COM3): ");
+            string comPort = Console.ReadLine();
+
+            Console.Write("Enter baud rate (default 9600): ");
+            string baudInput = Console.ReadLine();
+            int baudRate = string.IsNullOrEmpty(baudInput) ? 9600 : int.Parse(baudInput);
+
+            // Setup serial port
+            _serialPort = new SerialPort(comPort, baudRate, Parity.None, 8, StopBits.One);
+            _serialPort.Open();
+            Console.WriteLine($"Connected to {comPort} at {baudRate} baud\n");
+
+            // Start monitoring music
+            Console.WriteLine("Monitoring music... Press Ctrl+C to stop");
+            await MonitorMusic();
         }
 
-        static async Task GetNowPlaying()
+        static async Task MonitorMusic()
+        {
+            while (true)
+            {
+                try
+                {
+                    string songInfo = await GetCurrentSong();
+
+                    if (!string.IsNullOrEmpty(songInfo) && songInfo != _lastSong)
+                    {
+                        _lastSong = songInfo;
+                        SendToArduino(songInfo);
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Sent: {songInfo}");
+                    }
+
+                    await Task.Delay(2000); // Check every 2 seconds
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error: {ex.Message}");
+                    await Task.Delay(5000);
+                }
+            }
+        }
+
+        static async Task<string> GetCurrentSong()
         {
             try
             {
-                // 1. Request the global session manager
                 var sessionManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-
-                // 2. Get the current active session
                 var currentSession = sessionManager.GetCurrentSession();
 
-                // 3. If a media session is active, get its properties
                 if (currentSession != null)
                 {
                     var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
-                    // Get timeline info (duration, position, status)
                     var timelineProperties = currentSession.GetTimelineProperties();
 
-                    // 4. Check if there's actually a song with a title
                     if (!string.IsNullOrWhiteSpace(mediaProperties.Title))
                     {
-                        Console.WriteLine("═══════════════════════════════");
-                        Console.WriteLine("═══════════════════════════════");
-                        Console.WriteLine($"🎵 Now Playing: {mediaProperties.Title}");
-                        Console.WriteLine($"🎤 Artist: {mediaProperties.Artist}");
-                        Console.WriteLine($"💿 Album: {mediaProperties.AlbumTitle}");
-                        //Console.WriteLine($"⏱️  Duration: {mediaProperties.Duration:hh\\:mm\\:ss}");
-                        Console.WriteLine("═══════════════════════════════");
-                    }
-                    else
-                    {
-                        Console.WriteLine("Media is playing but no song info is available.");
+                        string artist = string.IsNullOrWhiteSpace(mediaProperties.Artist) ? "Unknown" : mediaProperties.Artist;
+                        string title = mediaProperties.Title;
+
+                        // Format: ARTIST|TITLE|DURATION|POSITION
+                        int duration = (int)timelineProperties.EndTime.TotalSeconds;
+                        int position = (int)timelineProperties.Position.TotalSeconds;
+
+                        // Encode to avoid special characters
+                        return $"{artist}|{title}|{duration}|{position}";
                     }
                 }
-                else
-                {
-                    Console.WriteLine("No media session is currently active. Please start playing a song.");
-                }
+                return null;
             }
-            catch (Exception ex)
+            catch
             {
-                Console.WriteLine($"An error occurred: {ex.Message}");
-                Console.WriteLine("Make sure you are playing media on your PC (e.g., Spotify, a YouTube video in a browser).");
+                return null;
+            }
+        }
+
+        static void SendToArduino(string data)
+        {
+            if (_serialPort != null && _serialPort.IsOpen)
+            {
+                // Old school style: send with start/end markers
+                _serialPort.Write($"<{data}>\n");
             }
         }
     }
