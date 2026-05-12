@@ -123,7 +123,7 @@ namespace MusicToArduino
                     Artist = artist,
                     Duration = (int)timelineProperties.EndTime.TotalSeconds,
                     Position = (int)timelineProperties.Position.TotalSeconds,
-                    Thumbnail = thumbnailBytes ?? _lastThumbnail
+                    Thumbnail = CreateTestThumbnail()
                 };
             }
             catch (Exception ex)
@@ -204,7 +204,33 @@ namespace MusicToArduino
                 return null;
             }
         }
+        static byte[] CreateTestThumbnail()
+        {
+            // Create a simple 80x80 gradient pattern for testing
+            byte[] rgb565 = new byte[80 * 80 * 2];
 
+            for (int y = 0; y < 80; y++)
+            {
+                for (int x = 0; x < 80; x++)
+                {
+                    // Create a rainbow pattern
+                    int r = (x * 31) / 80;
+                    int g = (y * 63) / 80;
+                    int b = ((x + y) * 31) / 160;
+
+                    ushort color = (ushort)((r << 11) | (g << 5) | b);
+
+                    int index = (y * 80 + x) * 2;
+                    rgb565[index] = (byte)(color & 0xFF);
+                    rgb565[index + 1] = (byte)((color >> 8) & 0xFF);
+                }
+            }
+
+            return rgb565;
+        }
+
+        // Use this to test if the Arduino can display ANY image:
+        // thumbnailBytes = CreateTestThumbnail();
         static void SendToArduino(SongData data)
         {
             if (_serialPort?.IsOpen != true) return;
