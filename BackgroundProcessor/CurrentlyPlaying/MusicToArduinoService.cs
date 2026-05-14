@@ -180,6 +180,7 @@ MinIntervalSeconds=3
                             //If current playing status has changed, then we go for it.
                             (_lastIsPlaying != currentIsPlaying && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
                             ||
+                            //Otherwise just send a "Hey we updated" every like 15 seconds or whatever config says.
                             ((DateTime.Now - _lastSendTime) >= _minSendInterval)
                             )
                         {
