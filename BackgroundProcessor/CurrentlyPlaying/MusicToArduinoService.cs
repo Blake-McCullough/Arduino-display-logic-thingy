@@ -1,13 +1,8 @@
 ﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System;
 using System.IO;
 using System.IO.Ports;
-using System.Threading;
-using System.Threading.Tasks;
 using Windows.Media.Control;
-using System.Drawing;
-using System.Drawing.Imaging;
 
 namespace MusicToArduino
 {
@@ -176,7 +171,12 @@ MinIntervalSeconds=3
                     if (songData != null)
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
-                        if ((DateTime.Now - _lastSendTime) >= _minSendInterval)
+                        //If isnt the same and has been 3 seconds since last check, otherwise if has been min time then do it.
+                        if (
+                            (_lastSongKey != currentKey && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
+                            ||
+                            ((DateTime.Now - _lastSendTime) >= _minSendInterval)
+                            )
                         {
                             _lastSongKey = currentKey;
                             _lastSendTime = DateTime.Now;

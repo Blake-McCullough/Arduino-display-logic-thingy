@@ -1,10 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System;
 using System.Diagnostics;
-using System.IO;
-using System.Threading.Tasks;
 
 namespace MusicToArduino
 {
@@ -12,30 +9,34 @@ namespace MusicToArduino
     {
         static async Task Main(string[] args)
         {
-            var isService = !(Debugger.IsAttached || args.Contains("--console"));
+            // Check if we should run in console mode
+            bool isConsoleMode = args.Contains("--console") || Debugger.IsAttached;
 
-            if (isService)
+            if (isConsoleMode)
             {
-                await CreateHostBuilder(args).Build().RunAsync();
-            }
-            else
-            {
-                // Run as console app for debugging
-                Console.WriteLine("Running in console mode for debugging...");
-                Console.WriteLine("Press Ctrl+C to exit");
+                Console.WriteLine("╔════════════════════════════════════════════════╗");
+                Console.WriteLine("║   Music To Arduino Bridge - Console Mode      ║");
+                Console.WriteLine("║   Press Ctrl+C to exit                        ║");
+                Console.WriteLine("╚════════════════════════════════════════════════╝");
+                Console.WriteLine();
 
                 var host = CreateHostBuilder(args).Build();
                 await host.StartAsync();
 
-                var waitHandle = new ManualResetEvent(false);
+                var tcs = new TaskCompletionSource<bool>();
                 Console.CancelKeyPress += (sender, e) =>
                 {
                     e.Cancel = true;
-                    waitHandle.Set();
+                    tcs.SetResult(true);
                 };
-                waitHandle.WaitOne();
 
+                await tcs.Task;
                 await host.StopAsync();
+            }
+            else
+            {
+                // Run as Windows Service
+                await CreateHostBuilder(args).Build().RunAsync();
             }
         }
 
@@ -53,12 +54,6 @@ namespace MusicToArduino
                         builder.AddEventLog();
                         builder.AddConsole();
                     });
-                })
-                .ConfigureLogging((context, logging) =>
-                {
-                    logging.ClearProviders();
-                    logging.AddEventLog();
-                    logging.AddConsole();
                 });
     }
 }
