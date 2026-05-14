@@ -14,15 +14,12 @@ namespace MusicToArduino
     {
         private static SerialPort _serialPort;
         private static string _lastSongKey = "";
-        private static byte[] _lastThumbnail = null;
         private static DateTime _lastSendTime = DateTime.MinValue;
         private static TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
         private static readonly object _serialLock = new object();
 
         // Chunk configuration
-        private const int CHUNK_SIZE = 512; // Bytes per chunk
         private const int MAX_RETRIES = 3;
-        private const int ACK_TIMEOUT = 2000; // milliseconds
 
         static async Task Main(string[] args)
         {
@@ -196,35 +193,7 @@ namespace MusicToArduino
                 return false;
             }
         }
-        static bool WaitForAck(int timeoutMs)
-        {
-            DateTime startTime = DateTime.Now;
-            while ((DateTime.Now - startTime).TotalMilliseconds < timeoutMs)
-            {
-                lock (_serialLock)
-                {
-                    if (_serialPort.BytesToRead > 0)
-                    {
-                        string response = _serialPort.ReadExisting();
-                        if (response.Contains("ACK"))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                Thread.Sleep(10);
-            }
-            return false;
-        }
-
-        static byte CalculateChecksum(byte[] data)
-        {
-            byte checksum = 0;
-            foreach (byte b in data)
-                checksum ^= b;
-            return checksum;
-        }
-
+       
         static async Task<SongData> GetCurrentSongData()
         {
             try
