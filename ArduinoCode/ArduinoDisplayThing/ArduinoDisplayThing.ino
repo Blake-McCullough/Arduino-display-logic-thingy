@@ -90,6 +90,7 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+  tft.invertDisplay(true);
   
   showWaitingScreen();
   
