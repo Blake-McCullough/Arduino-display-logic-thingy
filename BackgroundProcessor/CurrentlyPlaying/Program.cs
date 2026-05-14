@@ -160,7 +160,7 @@ namespace MusicToArduino
                 byte[] metadataBytes = System.Text.Encoding.UTF8.GetBytes(metadata);
 
                 // Get thumbnail data
-                byte[] thumbnail = data.Thumbnail ?? CreateTestThumbnail();
+                byte[] thumbnail = data.Thumbnail;
 
                 // Send metadata
                 lock (_serialLock)
@@ -228,7 +228,7 @@ namespace MusicToArduino
 
                 // Only process thumbnail for new songs
                 string currentKey = $"{title}|{artist}";
-                if (currentKey != _lastSongKey && mediaProperties.Thumbnail != null)
+                if ( mediaProperties.Thumbnail != null)
                 {
                     thumbnailBytes = await GetAndConvertThumbnail(mediaProperties.Thumbnail);
                     if (thumbnailBytes != null)
