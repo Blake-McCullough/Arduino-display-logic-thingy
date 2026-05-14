@@ -156,7 +156,7 @@ namespace MusicToArduino
                 }
 
                 // Prepare metadata string with newline terminator
-                string metadata = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|{data.Source}\n";
+                string metadata = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|{data.Source}|{data.IsPlaying}\n";
                 byte[] metadataBytes = System.Text.Encoding.UTF8.GetBytes(metadata);
 
                 // Get thumbnail data
@@ -246,6 +246,7 @@ namespace MusicToArduino
                     Duration = (int)timelineProperties.EndTime.TotalSeconds,
                     Position = (int)timelineProperties.Position.TotalSeconds,
                     Source = sourceApp,
+                    IsPlaying = isPlaying,  // Add this
                     Thumbnail = thumbnailBytes ?? CreateTestThumbnail()
                 };
             }
@@ -342,6 +343,7 @@ namespace MusicToArduino
         public int Duration { get; set; }
         public int Position { get; set; }
         public string Source { get; set; }
+        public bool IsPlaying { get; set; }
         public byte[] Thumbnail { get; set; }
     }
 }

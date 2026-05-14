@@ -7,9 +7,9 @@ String currentArtist = "";
 String currentSource = "";
 int currentDuration = 0;
 int currentPosition = 0;
+bool isPlaying = false;  // Add this
 unsigned long lastDataReceived = 0;
 unsigned long lastPositionUpdate = 0;
-bool isPlaying = false;
 
 #define THUMBNAIL_SIZE 12800
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
@@ -79,7 +79,7 @@ void loop() {
     lastDataReceived = millis(); // Reset timeout on any data received
   }
   
-  // Update position if we have a song
+  // Update position only if playing
   if (currentDuration > 0 && isPlaying) {
     updatePosition();
   }
@@ -136,7 +136,6 @@ void processIncomingData() {
           if (thumbnailBytesRead == THUMBNAIL_SIZE) {
             hasThumbnail = true;
             currentState = WAITING_FOR_START;
-            isPlaying = true;
             lastPositionUpdate = millis();
             lastDataReceived = millis();
             
@@ -175,6 +174,7 @@ void updatePosition() {
       if (currentPosition >= currentDuration) {
         Serial.println("Song ended");
         isPlaying = false;
+        updateProgressDisplay(); // Update to show paused/ended state
       }
     }
   }
@@ -184,18 +184,21 @@ void parseMetadata(String metadata) {
   Serial.print("Metadata: ");
   Serial.println(metadata);
   
-  // Parse 5 fields now (including source)
+  // Parse 6 fields now (including isPlaying)
   int firstPipe = metadata.indexOf('|');
   int secondPipe = metadata.indexOf('|', firstPipe + 1);
   int thirdPipe = metadata.indexOf('|', secondPipe + 1);
   int fourthPipe = metadata.indexOf('|', thirdPipe + 1);
+  int fifthPipe = metadata.indexOf('|', fourthPipe + 1);
   
-  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0) {
+  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0 && fifthPipe > 0) {
     currentTitle = metadata.substring(0, firstPipe);
     currentArtist = metadata.substring(firstPipe + 1, secondPipe);
     currentDuration = metadata.substring(secondPipe + 1, thirdPipe).toInt();
     currentPosition = metadata.substring(thirdPipe + 1, fourthPipe).toInt();
-    currentSource = metadata.substring(fourthPipe + 1);
+    currentSource = metadata.substring(fourthPipe + 1, fifthPipe);
+    String playingStatus = metadata.substring(fifthPipe + 1);
+    isPlaying = (playingStatus == "True" || playingStatus == "true");
     
     // Clean up source string (remove common prefixes)
     currentSource.replace("Microsoft.", "");
@@ -206,7 +209,6 @@ void parseMetadata(String metadata) {
     
     // Reset position tracking
     lastPositionUpdate = millis();
-    isPlaying = true;
     
     Serial.println("Parsed values:");
     Serial.print("  Title: ");
@@ -219,6 +221,8 @@ void parseMetadata(String metadata) {
     Serial.println(currentPosition);
     Serial.print("  Source: ");
     Serial.println(currentSource);
+    Serial.print("  IsPlaying: ");
+    Serial.println(isPlaying ? "Yes" : "No");
   } else {
     Serial.println("Failed to parse metadata!");
   }
@@ -279,26 +283,8 @@ void drawMainScreen() {
   }
   tft.println(displayArtist);
   
-  // Progress bar background
-  int barWidth = tft.width() - 20;
-  int barX = 10;
-  int barY = 175;
-  int barHeight = 8;
-  tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
-  
-  // Initial progress bar
-  if (currentDuration > 0) {
-    int progressWidth = (currentPosition * barWidth) / currentDuration;
-    if (progressWidth > 0) {
-      tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
-    }
-  }
-  
-  // Time text (left side)
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(10, 195);
-  tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
+  // Progress bar area (will be updated based on play state)
+  updateProgressDisplay();
   
   // Source text (right side)
   if (currentSource.length() > 0) {
@@ -315,38 +301,65 @@ void drawMainScreen() {
 
 void updateProgressDisplay() {
   static int lastDisplayedPosition = -1;
+  static bool lastPlayingState = false;
   
-  // Only update if position has changed
-  if (currentPosition != lastDisplayedPosition && currentDuration > 0) {
-    int barWidth = tft.width() - 20;
-    int barX = 10;
-    int barY = 175;
-    int barHeight = 8;
-    
-    // Calculate progress
-    int progressWidth = (currentPosition * barWidth) / currentDuration;
-    
-    // Update progress bar
+  int barWidth = tft.width() - 20;
+  int barX = 10;
+  int barY = 175;
+  int barHeight = 8;
+  
+  if (!isPlaying) {
+    // Show "PAUSED" text in the center of the progress bar area
     tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
-    if (progressWidth > 0) {
-      tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
-    }
     
-    // Update time text
+    // Clear the time area and show PAUSED
     tft.fillRect(10, 195, 100, 15, TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(barX + (barWidth / 2) - 30, barY - 2);
+    tft.println("PAUSED");
+    
+    // Still show the time (but don't update position)
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setCursor(10, 195);
     tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
     
     lastDisplayedPosition = currentPosition;
+    lastPlayingState = false;
+  } 
+  else if (isPlaying && currentDuration > 0) {
+    // Clear any "PAUSED" text
+    tft.fillRect(barX, barY - 12, barWidth, 12, TFT_BLACK);
     
-    // Optional: Print debug info occasionally
-    static int debugCounter = 0;
-    if (debugCounter++ % 10 == 0) {
-      Serial.print("Position updated: ");
-      Serial.print(currentPosition);
-      Serial.print("/");
-      Serial.println(currentDuration);
+    // Only update if position has changed
+    if (currentPosition != lastDisplayedPosition) {
+      // Calculate progress
+      int progressWidth = (currentPosition * barWidth) / currentDuration;
+      
+      // Update progress bar
+      tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
+      if (progressWidth > 0) {
+        tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
+      }
+      
+      // Update time text
+      tft.fillRect(10, 195, 100, 15, TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(10, 195);
+      tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
+      
+      lastDisplayedPosition = currentPosition;
+      
+      // Debug output
+      static int debugCounter = 0;
+      if (debugCounter++ % 10 == 0) {
+        Serial.print("Position updated: ");
+        Serial.print(currentPosition);
+        Serial.print("/");
+        Serial.println(currentDuration);
+      }
     }
+    lastPlayingState = true;
   }
 }
 
