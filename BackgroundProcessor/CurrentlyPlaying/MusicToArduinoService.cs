@@ -174,11 +174,12 @@ MinIntervalSeconds=3
                         string currentKey = $"{songData.Title}|{songData.Artist}";
                         bool currentIsPlaying = songData.IsPlaying;
                         //If isnt the same and has been 3 seconds since last check, otherwise if has been min time then do it.
+                        bool hasBeenCooldownTime = (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3);
                         if (
-                            (_lastSongKey != currentKey && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
+                            (_lastSongKey != currentKey && hasBeenCooldownTime)
                             ||
                             //If current playing status has changed, then we go for it.
-                            (_lastIsPlaying != currentIsPlaying && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
+                            (_lastIsPlaying != currentIsPlaying && hasBeenCooldownTime)
                             ||
                             //Otherwise just send a "Hey we updated" every like 15 seconds or whatever config says.
                             ((DateTime.Now - _lastSendTime) >= _minSendInterval)
