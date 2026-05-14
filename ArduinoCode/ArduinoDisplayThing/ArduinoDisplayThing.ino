@@ -11,11 +11,21 @@ int currentPosition = 0;
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
 bool hasThumbnail = false;
 
+// Simple state machine
+enum State {
+  WAITING_FOR_START,
+  READING_METADATA,
+  READING_THUMBNAIL
+};
+
+State currentState = WAITING_FOR_START;
+String metadataBuffer = "";
+int thumbnailBytesRead = 0;
+
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32 Starting...");
   
-  // Backlight ON
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
   
@@ -25,7 +35,6 @@ void setup() {
   
   drawWaitingScreen();
   
-  // Flash LED to show ready
   pinMode(4, OUTPUT);
   for (int i = 0; i < 3; i++) {
     digitalWrite(4, HIGH);
@@ -33,6 +42,8 @@ void setup() {
     digitalWrite(4, LOW);
     delay(100);
   }
+  
+  Serial.println("Ready to receive data");
 }
 
 void drawWaitingScreen() {
@@ -47,58 +58,81 @@ void drawWaitingScreen() {
 
 void loop() {
   if (Serial.available()) {
-    readSerialData();
+    processIncomingData();
   }
   
-  // Update progress bar if we have a song
   if (currentDuration > 0) {
     updateProgressDisplay();
   }
   
-  delay(50);
+  delay(10);
 }
 
-void readSerialData() {
-  Serial.println("\n=== Reading Serial Data ===");
-  
-  // Clear buffer
-  String header = "";
-  unsigned long timeout = millis() + 5000;
-  bool foundNewline = false;
-  
-  // Read header until newline
-  while (millis() < timeout) {
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n') {
-        foundNewline = true;
-        Serial.println("Found newline, header complete");
+void processIncomingData() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    
+    switch (currentState) {
+      case WAITING_FOR_START:
+        // Wait for 'S' character as start marker
+        if (c == 'S') {
+          currentState = READING_METADATA;
+          metadataBuffer = "";
+          thumbnailBytesRead = 0;
+          Serial.println("Start marker received");
+        }
         break;
-      }
-      header += c;
+        
+      case READING_METADATA:
+        if (c == '\n') {
+          // End of metadata, switch to thumbnail reading
+          parseMetadata(metadataBuffer);
+          currentState = READING_THUMBNAIL;
+          Serial.println("Metadata received, waiting for thumbnail...");
+        } else {
+          metadataBuffer += c;
+        }
+        break;
+        
+      case READING_THUMBNAIL:
+        // Read thumbnail data directly into buffer
+        if (thumbnailBytesRead < THUMBNAIL_SIZE) {
+          thumbnailBuffer[thumbnailBytesRead++] = c;
+          
+          if (thumbnailBytesRead == THUMBNAIL_SIZE) {
+            hasThumbnail = true;
+            currentState = WAITING_FOR_START;
+            Serial.println("Thumbnail received complete!");
+            
+            // Draw the screen with new data
+            drawMainScreen();
+            
+            // Flash LED to show we got data
+            digitalWrite(4, HIGH);
+            delay(200);
+            digitalWrite(4, LOW);
+            
+            Serial.println("Ready for next song");
+          }
+        }
+        break;
     }
-    delay(1);
   }
+}
+
+void parseMetadata(String metadata) {
+  Serial.print("Metadata: ");
+  Serial.println(metadata);
   
-  if (!foundNewline) {
-    Serial.println("Timeout waiting for newline");
-    return;
-  }
+  int firstPipe = metadata.indexOf('|');
+  int secondPipe = metadata.indexOf('|', firstPipe + 1);
+  int thirdPipe = metadata.indexOf('|', secondPipe + 1);
   
-  Serial.print("Header: ");
-  Serial.println(header);
-  
-  // Parse header
-  int firstPipe = header.indexOf('|');
-  int secondPipe = header.indexOf('|', firstPipe + 1);
-  int thirdPipe = header.indexOf('|', secondPipe + 1);
-  int fourthPipe = header.indexOf('|', thirdPipe + 1);
-  
-  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0) {
-    currentTitle = header.substring(0, firstPipe);
-    currentArtist = header.substring(firstPipe + 1, secondPipe);
-    currentDuration = header.substring(secondPipe + 1, thirdPipe).toInt();
-    currentPosition = header.substring(thirdPipe + 1, fourthPipe).toInt();
+  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0) {
+    currentTitle = metadata.substring(0, firstPipe);
+    currentArtist = metadata.substring(firstPipe + 1, secondPipe);
+    currentDuration = metadata.substring(secondPipe + 1, thirdPipe).toInt();
+    currentPosition = metadata.substring(thirdPipe + 1).toInt();
     
     Serial.println("Parsed values:");
     Serial.print("  Title: ");
@@ -109,64 +143,8 @@ void readSerialData() {
     Serial.println(currentDuration);
     Serial.print("  Position: ");
     Serial.println(currentPosition);
-    
-    // Read thumbnail data
-    Serial.print("Reading thumbnail (expecting ");
-    Serial.print(THUMBNAIL_SIZE);
-    Serial.println(" bytes)...");
-    
-    int bytesRead = 0;
-    timeout = millis() + 3000;
-    
-    while (bytesRead < THUMBNAIL_SIZE && millis() < timeout) {
-      if (Serial.available()) {
-        thumbnailBuffer[bytesRead++] = Serial.read();
-      }
-    }
-    
-    Serial.print("Bytes read: ");
-    Serial.println(bytesRead);
-    
-    if (bytesRead == THUMBNAIL_SIZE) {
-      hasThumbnail = true;
-      
-      // Verify the thumbnail data isn't all zeros
-      int nonZeroCount = 0;
-      for (int i = 0; i < 100; i++) {
-        if (thumbnailBuffer[i] != 0) nonZeroCount++;
-      }
-      
-      Serial.print("Non-zero bytes in first 100: ");
-      Serial.println(nonZeroCount);
-      
-      // Print first 20 bytes for debugging
-      Serial.print("First 20 bytes: ");
-      for (int i = 0; i < 20; i++) {
-        Serial.print(thumbnailBuffer[i], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
-      
-      if (nonZeroCount == 0) {
-        Serial.println("WARNING: Thumbnail data is all zeros!");
-        hasThumbnail = false;
-      } else {
-        Serial.println("Thumbnail data looks valid!");
-      }
-    } else {
-      Serial.println("ERROR: Didn't receive enough thumbnail bytes!");
-      hasThumbnail = false;
-    }
-    
-    // Draw the main screen
-    drawMainScreen();
-    
-    // Flash LED to show we got data
-    digitalWrite(4, HIGH);
-    delay(200);
-    digitalWrite(4, LOW);
   } else {
-    Serial.println("Failed to parse header");
+    Serial.println("Failed to parse metadata!");
   }
 }
 
@@ -174,17 +152,13 @@ void drawMainScreen() {
   Serial.println("Drawing main screen...");
   tft.fillScreen(TFT_BLACK);
   
-  // Draw thumbnail
   int thumbX = (tft.width() - 80) / 2;
   int thumbY = 10;
   
   if (hasThumbnail) {
-    Serial.println("Drawing thumbnail from buffer...");
-    
-    // Draw a colored border around thumbnail area to confirm positioning
+    Serial.println("Drawing thumbnail...");
     tft.drawRect(thumbX - 1, thumbY - 1, 82, 82, TFT_RED);
     
-    // Draw the RGB565 image
     for (int y = 0; y < 80; y++) {
       for (int x = 0; x < 80; x++) {
         int idx = (y * 80 + x) * 2;
@@ -195,11 +169,8 @@ void drawMainScreen() {
       }
     }
     Serial.println("Thumbnail drawing complete");
-    
-    // Draw a test pattern to verify display working
-    tft.fillRect(thumbX + 30, thumbY + 30, 20, 20, TFT_RED);
   } else {
-    Serial.println("No thumbnail, drawing placeholder");
+    Serial.println("No thumbnail available");
     tft.fillRect(thumbX, thumbY, 80, 80, TFT_DARKGREY);
     tft.drawRect(thumbX, thumbY, 80, 80, TFT_WHITE);
     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -269,13 +240,11 @@ void updateProgressDisplay() {
     
     int progressWidth = (currentPosition * barWidth) / currentDuration;
     
-    // Update progress bar
     tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
     if (progressWidth > 0) {
       tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
     }
     
-    // Update time
     tft.fillRect(10, 195, 150, 15, TFT_BLACK);
     tft.setCursor(10, 195);
     tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
