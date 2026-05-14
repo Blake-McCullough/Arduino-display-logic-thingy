@@ -1,0 +1,1 @@
+CreateObject("Wscript.Shell").Run "C:\MusicToArduinoService\CurrentlyPlaying.exe", 0, False
