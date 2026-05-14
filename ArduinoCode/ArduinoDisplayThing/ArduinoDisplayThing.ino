@@ -8,7 +8,7 @@ String currentArtist = "";
 String currentSource = "";
 int currentDuration = 0;
 int currentPosition = 0;
-int initialPosition = 0;  // Store the starting position when song starts/resumes
+int initialPosition = 0;
 bool isPlaying = false;
 bool hasValidSong = false;
 
@@ -23,12 +23,22 @@ bool lastHasThumbnail = false;
 String currentSongKey = "";
 String lastSongKey = "";
 
+// Scrolling text variables
+String scrollingTitle = "";
+String scrollingArtist = "";
+int titleScrollPos = 0;
+int artistScrollPos = 0;
+unsigned long lastScrollTime = 0;
+unsigned long lastScrollUpdate = 0;
+#define SCROLL_DELAY_MS 500  // Speed of scrolling (lower = faster)
+#define SCROLL_PADDING 5     // Extra spaces for smooth scrolling
+
 // Time tracking
 unsigned long lastDataReceived = 0;
 unsigned long lastPositionUpdate = 0;
-unsigned long songStartTime = 0;  // When the song started playing (millis)
-unsigned long pausedTime = 0;      // Total time spent paused
-unsigned long lastPauseTime = 0;   // When the last pause started
+unsigned long songStartTime = 0;
+unsigned long pausedTime = 0;
+unsigned long lastPauseTime = 0;
 
 #define THUMBNAIL_SIZE 12800
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
@@ -48,10 +58,12 @@ int thumbnailBytesRead = 0;
 
 // Timeout settings
 #define DATA_TIMEOUT_MS 30000
-#define POSITION_UPDATE_INTERVAL_MS 500  // Update display every 100ms for smoother progress
+#define POSITION_UPDATE_INTERVAL_MS 500
 
-// Screen positions (assuming 320x240 display)
-const int THUMB_X = (320 - 80) / 2;
+// Display dimensions
+const int SCREEN_WIDTH = 320;
+const int SCREEN_HEIGHT = 240;
+const int THUMB_X = (SCREEN_WIDTH - 80) / 2;
 const int THUMB_Y = 10;
 const int TITLE_X = 10;
 const int TITLE_Y = 110;
@@ -63,6 +75,10 @@ const int BAR_WIDTH = 300;
 const int BAR_HEIGHT = 8;
 const int TIME_X = 10;
 const int TIME_Y = 195;
+
+// Max characters that fit on screen (adjust based on your font)
+const int MAX_TITLE_CHARS = 24;  // Characters that fit on screen at text size 2
+const int MAX_ARTIST_CHARS = 35;  // Characters that fit on screen at text size 1
 
 void setup() {
   Serial.begin(115200);
@@ -132,25 +148,14 @@ void renderFullScreen() {
     tft.println("ART");
   }
   
-  // Draw title
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(TITLE_X, TITLE_Y);
-  String displayTitle = currentTitle;
-  if (displayTitle.length() > 24) {
-    displayTitle = displayTitle.substring(0, 22) + "...";
-  }
-  tft.println(displayTitle);
+  // Initialize scrolling for title and artist
+  initScrollingText();
   
-  // Draw artist
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(ARTIST_X, ARTIST_Y);
-  String displayArtist = currentArtist;
-  if (displayArtist.length() > 35) {
-    displayArtist = displayArtist.substring(0, 32) + "...";
-  }
-  tft.println(displayArtist);
+  // Draw title (first frame)
+  drawScrollingTitle();
+  
+  // Draw artist (first frame)
+  drawScrollingArtist();
   
   // Draw progress bar background
   tft.fillRect(BAR_X, BAR_Y, BAR_WIDTH, BAR_HEIGHT, TFT_DARKGREY);
@@ -159,7 +164,7 @@ void renderFullScreen() {
   if (currentSource.length() > 0) {
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
     tft.setTextSize(1);
-    int sourceX = tft.width() - 10 - (currentSource.length() * 6);
+    int sourceX = SCREEN_WIDTH - 10 - (currentSource.length() * 6);
     if (sourceX < 120) sourceX = 120;
     tft.setCursor(sourceX, TIME_Y);
     tft.println(currentSource);
@@ -170,6 +175,98 @@ void renderFullScreen() {
   updatePlayPauseState();
   
   hasValidSong = true;
+}
+
+void initScrollingText() {
+  // Prepare scrolling title with padding
+  scrollingTitle = currentTitle;
+  if (scrollingTitle.length() > MAX_TITLE_CHARS) {
+    // Add spaces for smooth scrolling
+    scrollingTitle = currentTitle + "   " + currentTitle + "   ";
+  }
+  
+  // Prepare scrolling artist with padding
+  scrollingArtist = currentArtist;
+  if (scrollingArtist.length() > MAX_ARTIST_CHARS) {
+    // Add spaces for smooth scrolling
+    scrollingArtist = currentArtist + "   " + currentArtist + "   ";
+  }
+  
+  titleScrollPos = 0;
+  artistScrollPos = 0;
+  lastScrollUpdate = millis();
+}
+
+void drawScrollingTitle() {
+  // Clear title area
+  tft.fillRect(TITLE_X, TITLE_Y - 20, SCREEN_WIDTH - 20, 30, TFT_BLACK);
+  
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  
+  if (currentTitle.length() <= MAX_TITLE_CHARS) {
+    // No scrolling needed, just center it
+    int xPos = TITLE_X;
+    tft.setCursor(xPos, TITLE_Y);
+    tft.println(currentTitle);
+  } else {
+    // Draw scrolling text
+    tft.setCursor(TITLE_X, TITLE_Y);
+    String displayText = scrollingTitle.substring(titleScrollPos, titleScrollPos + MAX_TITLE_CHARS);
+    tft.println(displayText);
+  }
+}
+
+void drawScrollingArtist() {
+  // Clear artist area
+  tft.fillRect(ARTIST_X, ARTIST_Y - 10, SCREEN_WIDTH - 20, 20, TFT_BLACK);
+  
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(1);
+  
+  if (currentArtist.length() <= MAX_ARTIST_CHARS) {
+    // No scrolling needed
+    tft.setCursor(ARTIST_X, ARTIST_Y);
+    tft.println(currentArtist);
+  } else {
+    // Draw scrolling text
+    tft.setCursor(ARTIST_X, ARTIST_Y);
+    String displayText = scrollingArtist.substring(artistScrollPos, artistScrollPos + MAX_ARTIST_CHARS);
+    tft.println(displayText);
+  }
+}
+
+void updateScrolling() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastScrollUpdate >= SCROLL_DELAY_MS) {
+    bool needsUpdate = false;
+    
+    // Update title scroll position if needed
+    if (currentTitle.length() > MAX_TITLE_CHARS) {
+      titleScrollPos++;
+      if (titleScrollPos > (currentTitle.length() + 3)) {
+        titleScrollPos = 0;
+      }
+      needsUpdate = true;
+    }
+    
+    // Update artist scroll position if needed
+    if (currentArtist.length() > MAX_ARTIST_CHARS) {
+      artistScrollPos++;
+      if (artistScrollPos > (currentArtist.length() + 3)) {
+        artistScrollPos = 0;
+      }
+      needsUpdate = true;
+    }
+    
+    if (needsUpdate) {
+      drawScrollingTitle();
+      drawScrollingArtist();
+    }
+    
+    lastScrollUpdate = currentTime;
+  }
 }
 
 void loop() {
@@ -185,6 +282,11 @@ void loop() {
   if (Serial.available()) {
     processIncomingData();
     lastDataReceived = millis();
+  }
+  
+  // Update scrolling text
+  if (hasValidSong) {
+    updateScrolling();
   }
   
   // Update position based on actual elapsed time
@@ -237,16 +339,6 @@ void updatePositionFromTime() {
   }
 }
 
-void resetPositionTiming() {
-  if (isPlaying) {
-    // Reset the start time to now, using current position as base
-    songStartTime = millis();
-    initialPosition = currentPosition;
-    Serial.print("Position timing reset - current position: ");
-    Serial.println(currentPosition);
-  }
-}
-
 void handlePlayStateChange(bool newPlayingState) {
   if (newPlayingState == isPlaying) return;
   
@@ -288,6 +380,8 @@ void resetToWaitingState() {
   songStartTime = 0;
   pausedTime = 0;
   lastPauseTime = 0;
+  titleScrollPos = 0;
+  artistScrollPos = 0;
 }
 
 void processIncomingData() {
@@ -348,6 +442,15 @@ void processIncomingData() {
                 // If we were playing, adjust timing
                 songStartTime = millis();
                 initialPosition = currentPosition;
+              }
+              
+              // Check if title or artist changed (for scrolling)
+              if (currentTitle != lastTitle || currentArtist != lastArtist) {
+                initScrollingText();
+                drawScrollingTitle();
+                drawScrollingArtist();
+                lastTitle = currentTitle;
+                lastArtist = currentArtist;
               }
               
               updateProgressAndTime();
