@@ -6,7 +6,8 @@ using Windows.Media.Control;
 using Windows.Storage.Streams;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace MusicToArduino
 {
@@ -18,10 +19,17 @@ namespace MusicToArduino
         private static DateTime _lastSendTime = DateTime.MinValue;
         private static TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
 
+        // SLIP special characters
+        private const byte SLIP_END = 0xC0;
+        private const byte SLIP_ESC = 0xDB;
+        private const byte SLIP_ESC_END = 0xDC;
+        private const byte SLIP_ESC_ESC = 0xDD;
+
         static async Task Main(string[] args)
         {
             Console.WriteLine("╔═══════════════════════════════════════╗");
             Console.WriteLine("║    Music Player to Arduino Bridge     ║");
+            Console.WriteLine("║         (SLIP Protocol v1.0)          ║");
             Console.WriteLine("╚═══════════════════════════════════════╝\n");
 
             string[] ports = SerialPort.GetPortNames();
@@ -45,7 +53,12 @@ namespace MusicToArduino
             {
                 _serialPort = new SerialPort(comPort, baudRate, Parity.None, 8, StopBits.One);
                 _serialPort.Open();
-                Console.WriteLine($"\n✓ Connected to {comPort}\n");
+                Console.WriteLine($"\n✓ Connected to {comPort} at {baudRate} baud\n");
+
+                // Start reading SLIP packets
+                _ = Task.Run(() => ReadSlipPackets());
+                _ = Task.Run(() => ReadArduinoOutput());
+
                 await MonitorMusic();
             }
             catch (Exception ex)
@@ -54,9 +67,36 @@ namespace MusicToArduino
                 Console.ReadKey();
             }
         }
+        static async Task ReadArduinoOutput()
+        {
+            try
+            {
+                while (_serialPort != null && _serialPort.IsOpen)
+                {
+                    if (_serialPort.BytesToRead > 0)
+                    {
+                        string line = _serialPort.ReadLine();
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            // Format Arduino output nicely
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.WriteLine($"[ARDUINO] {line}");
+                            Console.ResetColor();
+                        }
+                    }
+                    await Task.Delay(10);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error reading from Arduino: {ex.Message}");
+            }
+        }
 
         static async Task MonitorMusic()
         {
+            await Task.Delay(2000); // Wait for Arduino to boot
+
             while (true)
             {
                 try
@@ -69,7 +109,7 @@ namespace MusicToArduino
                         {
                             _lastSongKey = currentKey;
                             _lastSendTime = DateTime.Now;
-                            SendToArduino(songData);
+                            SendSlipPacket(songData);
                             Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✓ {songData.Title} - {songData.Artist}");
                         }
                     }
@@ -81,6 +121,155 @@ namespace MusicToArduino
                     await Task.Delay(5000);
                 }
             }
+        }
+
+        static void SendSlipPacket(SongData data)
+        {
+            if (_serialPort?.IsOpen != true) return;
+
+            try
+            {
+                // Build packet data
+                using (var ms = new MemoryStream())
+                {
+                    // Write header as UTF-8
+                    string header = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}";
+                    byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
+                    ms.Write(headerBytes, 0, headerBytes.Length);
+
+                    // Add separator
+                    ms.WriteByte(0x00); // Null separator between header and thumbnail
+
+                    // Write thumbnail if available
+                    if (data.Thumbnail != null && data.Thumbnail.Length == 12800)
+                    {
+                        ms.Write(data.Thumbnail, 0, data.Thumbnail.Length);
+                    }
+
+                    byte[] packetData = ms.ToArray();
+
+                    // SLIP encode and send
+                    byte[] slipPacket = SlipEncode(packetData);
+                    _serialPort.Write(slipPacket, 0, slipPacket.Length);
+                    _serialPort.BaseStream.Flush();
+
+                    Console.WriteLine($"  → Sent SLIP packet: {packetData.Length} bytes data → {slipPacket.Length} bytes SLIP");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Send error: {ex.Message}");
+            }
+        }
+
+        static byte[] SlipEncode(byte[] data)
+        {
+            using (var ms = new MemoryStream())
+            {
+                ms.WriteByte(SLIP_END); // Start with END
+
+                foreach (byte b in data)
+                {
+                    if (b == SLIP_END)
+                    {
+                        ms.WriteByte(SLIP_ESC);
+                        ms.WriteByte(SLIP_ESC_END);
+                    }
+                    else if (b == SLIP_ESC)
+                    {
+                        ms.WriteByte(SLIP_ESC);
+                        ms.WriteByte(SLIP_ESC_ESC);
+                    }
+                    else
+                    {
+                        ms.WriteByte(b);
+                    }
+                }
+
+                ms.WriteByte(SLIP_END); // End with END
+                return ms.ToArray();
+            }
+        }
+
+        static async Task ReadSlipPackets()
+        {
+            List<byte> packetBuffer = new List<byte>();
+            bool inPacket = false;
+
+            while (_serialPort != null && _serialPort.IsOpen)
+            {
+                try
+                {
+                    if (_serialPort.BytesToRead > 0)
+                    {
+                        byte b = (byte)_serialPort.ReadByte();
+
+                        if (b == SLIP_END)
+                        {
+                            if (inPacket && packetBuffer.Count > 0)
+                            {
+                                // Decode and process packet
+                                byte[] decoded = SlipDecode(packetBuffer.ToArray());
+                                ProcessArduinoPacket(decoded);
+                                packetBuffer.Clear();
+                                inPacket = false;
+                            }
+                            else
+                            {
+                                inPacket = true;
+                            }
+                        }
+                        else if (inPacket)
+                        {
+                            packetBuffer.Add(b);
+                        }
+                    }
+                    await Task.Delay(5);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Read error: {ex.Message}");
+                }
+            }
+        }
+
+        static byte[] SlipDecode(byte[] data)
+        {
+            using (var ms = new MemoryStream())
+            {
+                for (int i = 0; i < data.Length; i++)
+                {
+                    if (data[i] == SLIP_ESC)
+                    {
+                        if (i + 1 < data.Length)
+                        {
+                            if (data[i + 1] == SLIP_ESC_END)
+                            {
+                                ms.WriteByte(SLIP_END);
+                                i++;
+                            }
+                            else if (data[i + 1] == SLIP_ESC_ESC)
+                            {
+                                ms.WriteByte(SLIP_ESC);
+                                i++;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ms.WriteByte(data[i]);
+                    }
+                }
+                return ms.ToArray();
+            }
+        }
+
+        static void ProcessArduinoPacket(byte[] packet)
+        {
+            string message = System.Text.Encoding.UTF8.GetString(packet);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"[ARDUINO] {message}");
+            Console.ResetColor();
         }
 
         static async Task<SongData> GetCurrentSongData()
@@ -101,20 +290,10 @@ namespace MusicToArduino
 
                 byte[] thumbnailBytes = null;
 
-                // Only process thumbnail for new songs
                 string currentKey = $"{title}|{artist}";
                 if (currentKey != _lastSongKey && mediaProperties.Thumbnail != null)
                 {
                     thumbnailBytes = await GetAndConvertThumbnail(mediaProperties.Thumbnail);
-                    if (thumbnailBytes != null)
-                    {
-                        // Save for debugging
-                        File.WriteAllBytes("latest_thumbnail.raw", thumbnailBytes);
-                        Console.WriteLine($"  Thumbnail: {thumbnailBytes.Length} bytes saved to latest_thumbnail.raw");
-
-                        // Verify first few bytes are valid
-                        Console.WriteLine($"  First bytes: {BitConverter.ToString(thumbnailBytes.Take(16).ToArray())}");
-                    }
                 }
 
                 return new SongData
@@ -123,7 +302,7 @@ namespace MusicToArduino
                     Artist = artist,
                     Duration = (int)timelineProperties.EndTime.TotalSeconds,
                     Position = (int)timelineProperties.Position.TotalSeconds,
-                    Thumbnail = CreateTestThumbnail()
+                    Thumbnail = thumbnailBytes ?? _lastThumbnail
                 };
             }
             catch (Exception ex)
@@ -137,12 +316,8 @@ namespace MusicToArduino
         {
             try
             {
-                // Open the stream
                 using (var stream = await thumbnailRef.OpenReadAsync())
                 {
-                    Console.WriteLine($"  Stream size: {stream.Size} bytes");
-
-                    // Read raw image bytes
                     byte[] rawBytes = new byte[stream.Size];
                     using (var dataReader = new DataReader(stream))
                     {
@@ -150,118 +325,42 @@ namespace MusicToArduino
                         dataReader.ReadBytes(rawBytes);
                     }
 
-                    // Save original for debugging
-                    File.WriteAllBytes("original_thumbnail.jpg", rawBytes);
-                    Console.WriteLine($"  Saved original thumbnail ({(rawBytes.Length / 1024)} KB)");
-
-                    // Convert to bitmap
                     using (var ms = new MemoryStream(rawBytes))
                     using (var originalImage = Image.FromStream(ms))
+                    using (var resizedBitmap = new Bitmap(80, 80))
+                    using (var graphics = Graphics.FromImage(resizedBitmap))
                     {
-                        Console.WriteLine($"  Original size: {originalImage.Width}x{originalImage.Height}");
+                        graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        graphics.DrawImage(originalImage, 0, 0, 80, 80);
 
-                        // Create resized 80x80 image
-                        using (var resizedBitmap = new Bitmap(80, 80))
-                        using (var graphics = Graphics.FromImage(resizedBitmap))
+                        byte[] rgb565 = new byte[80 * 80 * 2];
+
+                        for (int y = 0; y < 80; y++)
                         {
-                            graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                            graphics.DrawImage(originalImage, 0, 0, 80, 80);
-
-                            // Convert to RGB565
-                            byte[] rgb565 = new byte[80 * 80 * 2];
-
-                            for (int y = 0; y < 80; y++)
+                            for (int x = 0; x < 80; x++)
                             {
-                                for (int x = 0; x < 80; x++)
-                                {
-                                    Color pixel = resizedBitmap.GetPixel(x, y);
+                                Color pixel = resizedBitmap.GetPixel(x, y);
 
-                                    // RGB565 conversion
-                                    int r = (pixel.R >> 3) & 0x1F;
-                                    int g = (pixel.G >> 2) & 0x3F;
-                                    int b = (pixel.B >> 3) & 0x1F;
+                                int r = (pixel.R >> 3) & 0x1F;
+                                int g = (pixel.G >> 2) & 0x3F;
+                                int b = (pixel.B >> 3) & 0x1F;
 
-                                    ushort rgb565Color = (ushort)((r << 11) | (g << 5) | b);
+                                ushort color = (ushort)((r << 11) | (g << 5) | b);
 
-                                    int index = (y * 80 + x) * 2;
-                                    rgb565[index] = (byte)(rgb565Color & 0xFF);     // Low byte
-                                    rgb565[index + 1] = (byte)((rgb565Color >> 8) & 0xFF); // High byte
-                                }
+                                int index = (y * 80 + x) * 2;
+                                rgb565[index] = (byte)(color & 0xFF);
+                                rgb565[index + 1] = (byte)((color >> 8) & 0xFF);
                             }
-
-                            // Create a test BMP to verify the resized image
-                            resizedBitmap.Save("resized_thumbnail.bmp", ImageFormat.Bmp);
-                            Console.WriteLine($"  Saved resized thumbnail to resized_thumbnail.bmp");
-
-                            return rgb565;
                         }
+
+                        return rgb565;
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  Thumbnail conversion failed: {ex.Message}");
+                Console.WriteLine($"Thumbnail error: {ex.Message}");
                 return null;
-            }
-        }
-        static byte[] CreateTestThumbnail()
-        {
-            // Create a simple 80x80 gradient pattern for testing
-            byte[] rgb565 = new byte[80 * 80 * 2];
-
-            for (int y = 0; y < 80; y++)
-            {
-                for (int x = 0; x < 80; x++)
-                {
-                    // Create a rainbow pattern
-                    int r = (x * 31) / 80;
-                    int g = (y * 63) / 80;
-                    int b = ((x + y) * 31) / 160;
-
-                    ushort color = (ushort)((r << 11) | (g << 5) | b);
-
-                    int index = (y * 80 + x) * 2;
-                    rgb565[index] = (byte)(color & 0xFF);
-                    rgb565[index + 1] = (byte)((color >> 8) & 0xFF);
-                }
-            }
-
-            return rgb565;
-        }
-
-        // Use this to test if the Arduino can display ANY image:
-        // thumbnailBytes = CreateTestThumbnail();
-        static void SendToArduino(SongData data)
-        {
-            if (_serialPort?.IsOpen != true) return;
-
-            try
-            {
-                // Send header
-                string header = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|";
-                byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
-                _serialPort.Write(headerBytes, 0, headerBytes.Length);
-
-                // Send thumbnail if available
-                if (data.Thumbnail != null && data.Thumbnail.Length == 12800)
-                {
-                    _serialPort.Write(data.Thumbnail, 0, data.Thumbnail.Length);
-                    Console.WriteLine($"  Sent thumbnail: 12800 bytes");
-                }
-                else
-                {
-                    // Send placeholder data (all zeros)
-                    byte[] placeholder = new byte[12800];
-                    _serialPort.Write(placeholder, 0, placeholder.Length);
-                    Console.WriteLine($"  Sent placeholder thumbnail");
-                }
-
-                _serialPort.Write(new byte[] { (byte)'\n' }, 0, 1);
-                _serialPort.BaseStream.Flush();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Send error: {ex.Message}");
             }
         }
     }

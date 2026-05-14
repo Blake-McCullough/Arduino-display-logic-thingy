@@ -2,20 +2,43 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
+// SLIP Protocol definitions
+#define SLIP_END     0xC0
+#define SLIP_ESC     0xDB
+#define SLIP_ESC_END 0xDC
+#define SLIP_ESC_ESC 0xDD
+
+// Packet buffer
+#define MAX_PACKET_SIZE 15000
+uint8_t packetBuffer[MAX_PACKET_SIZE];
+int packetIndex = 0;
+bool inPacket = false;
+
+// Current song data
 String currentTitle = "Waiting...";
 String currentArtist = "";
 int currentDuration = 0;
 int currentPosition = 0;
 
+// Thumbnail buffer (80x80 RGB565 = 12800 bytes)
 #define THUMBNAIL_SIZE 12800
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
 bool hasThumbnail = false;
 
+// Scrolling text variables
+int scrollOffset = 0;
+unsigned long lastScrollTime = 0;
+String fullTitle = "";
+
 void setup() {
-  Serial.begin(115200);
-  Serial.println("ESP32 Starting...");
+  delay(2000);  // Wait for PC to open serial port
   
-  // Backlight ON
+  Serial.begin(115200);
+  Serial.setTimeout(5000);
+  
+  Serial.println("ESP32 Starting with SLIP Protocol...");
+  
+  // Backlight ON for Cheap Yellow Display
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
   
@@ -33,6 +56,8 @@ void setup() {
     digitalWrite(4, LOW);
     delay(100);
   }
+  
+  Serial.println("SLIP Ready - Waiting for packets...");
 }
 
 void drawWaitingScreen() {
@@ -46,145 +71,164 @@ void drawWaitingScreen() {
 }
 
 void loop() {
-  if (Serial.available()) {
-    readSerialData();
+  // Process incoming serial data
+  while (Serial.available()) {
+    uint8_t c = Serial.read();
+    
+    if (c == SLIP_END) {
+      if (inPacket && packetIndex > 0) {
+        // Decode and process packet
+        processSlipPacket(packetBuffer, packetIndex);
+        packetIndex = 0;
+        inPacket = false;
+      } else {
+        inPacket = true;
+        packetIndex = 0;
+      }
+    } else if (inPacket) {
+      if (packetIndex < MAX_PACKET_SIZE - 1) {
+        packetBuffer[packetIndex++] = c;
+      }
+    }
   }
   
-  // Update progress bar if we have a song
-  if (currentDuration > 0) {
+  // Update scrolling text
+  updateScrollingText();
+  
+  // Update progress bar
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate > 100 && currentDuration > 0) {
     updateProgressDisplay();
+    lastUpdate = millis();
   }
   
-  delay(50);
+  delay(10);
 }
 
-void readSerialData() {
-  Serial.println("\n=== Reading Serial Data ===");
+void processSlipPacket(uint8_t* data, int len) {
+  // Decode SLIP data
+  uint8_t decoded[MAX_PACKET_SIZE];
+  int decodedLen = 0;
   
-  // Clear buffer
-  String header = "";
-  unsigned long timeout = millis() + 5000;
-  bool foundNewline = false;
-  
-  // Read header until newline
-  while (millis() < timeout) {
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n') {
-        foundNewline = true;
-        Serial.println("Found newline, header complete");
-        break;
-      }
-      header += c;
-    }
-    delay(1);
-  }
-  
-  if (!foundNewline) {
-    Serial.println("Timeout waiting for newline");
-    return;
-  }
-  
-  Serial.print("Header: ");
-  Serial.println(header);
-  
-  // Parse header
-  int firstPipe = header.indexOf('|');
-  int secondPipe = header.indexOf('|', firstPipe + 1);
-  int thirdPipe = header.indexOf('|', secondPipe + 1);
-  int fourthPipe = header.indexOf('|', thirdPipe + 1);
-  
-  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0) {
-    currentTitle = header.substring(0, firstPipe);
-    currentArtist = header.substring(firstPipe + 1, secondPipe);
-    currentDuration = header.substring(secondPipe + 1, thirdPipe).toInt();
-    currentPosition = header.substring(thirdPipe + 1, fourthPipe).toInt();
-    
-    Serial.println("Parsed values:");
-    Serial.print("  Title: ");
-    Serial.println(currentTitle);
-    Serial.print("  Artist: ");
-    Serial.println(currentArtist);
-    Serial.print("  Duration: ");
-    Serial.println(currentDuration);
-    Serial.print("  Position: ");
-    Serial.println(currentPosition);
-    
-    // Read thumbnail data
-    Serial.print("Reading thumbnail (expecting ");
-    Serial.print(THUMBNAIL_SIZE);
-    Serial.println(" bytes)...");
-    
-    int bytesRead = 0;
-    timeout = millis() + 3000;
-    
-    while (bytesRead < THUMBNAIL_SIZE && millis() < timeout) {
-      if (Serial.available()) {
-        thumbnailBuffer[bytesRead++] = Serial.read();
-      }
-    }
-    
-    Serial.print("Bytes read: ");
-    Serial.println(bytesRead);
-    
-    if (bytesRead == THUMBNAIL_SIZE) {
-      hasThumbnail = true;
-      
-      // Verify the thumbnail data isn't all zeros
-      int nonZeroCount = 0;
-      for (int i = 0; i < 100; i++) {
-        if (thumbnailBuffer[i] != 0) nonZeroCount++;
-      }
-      
-      Serial.print("Non-zero bytes in first 100: ");
-      Serial.println(nonZeroCount);
-      
-      // Print first 20 bytes for debugging
-      Serial.print("First 20 bytes: ");
-      for (int i = 0; i < 20; i++) {
-        Serial.print(thumbnailBuffer[i], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
-      
-      if (nonZeroCount == 0) {
-        Serial.println("WARNING: Thumbnail data is all zeros!");
-        hasThumbnail = false;
-      } else {
-        Serial.println("Thumbnail data looks valid!");
+  for (int i = 0; i < len; i++) {
+    if (data[i] == SLIP_ESC) {
+      if (i + 1 < len) {
+        if (data[i + 1] == SLIP_ESC_END) {
+          decoded[decodedLen++] = SLIP_END;
+          i++;
+        } else if (data[i + 1] == SLIP_ESC_ESC) {
+          decoded[decodedLen++] = SLIP_ESC;
+          i++;
+        }
       }
     } else {
-      Serial.println("ERROR: Didn't receive enough thumbnail bytes!");
-      hasThumbnail = false;
+      decoded[decodedLen++] = data[i];
+    }
+  }
+  
+  // Parse packet - find null separator between header and thumbnail
+  int separator = -1;
+  for (int i = 0; i < decodedLen; i++) {
+    if (decoded[i] == 0x00) {
+      separator = i;
+      break;
+    }
+  }
+  
+  if (separator > 0) {
+    // Extract header (before null)
+    String header = "";
+    for (int i = 0; i < separator; i++) {
+      header += (char)decoded[i];
     }
     
-    // Draw the main screen
-    drawMainScreen();
+    // Parse header: TITLE|ARTIST|DURATION|POSITION
+    int firstPipe = header.indexOf('|');
+    int secondPipe = header.indexOf('|', firstPipe + 1);
+    int thirdPipe = header.indexOf('|', secondPipe + 1);
     
-    // Flash LED to show we got data
-    digitalWrite(4, HIGH);
-    delay(200);
-    digitalWrite(4, LOW);
+    if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0) {
+      currentTitle = header.substring(0, firstPipe);
+      currentArtist = header.substring(firstPipe + 1, secondPipe);
+      currentDuration = header.substring(secondPipe + 1, thirdPipe).toInt();
+      currentPosition = header.substring(thirdPipe + 1).toInt();
+      
+      fullTitle = currentTitle;
+      scrollOffset = 0;
+      
+      // Extract thumbnail (after null)
+      int thumbnailOffset = separator + 1;
+      int thumbnailLen = decodedLen - thumbnailOffset;
+      
+      if (thumbnailLen == THUMBNAIL_SIZE) {
+        memcpy(thumbnailBuffer, decoded + thumbnailOffset, THUMBNAIL_SIZE);
+        
+        // Verify thumbnail has data
+        int nonZeroCount = 0;
+        for (int i = 0; i < 100; i++) {
+          if (thumbnailBuffer[i] != 0) nonZeroCount++;
+        }
+        
+        hasThumbnail = (nonZeroCount > 10);
+        
+        // Send acknowledgment
+        Serial.write(SLIP_END);
+        String ack = "THUMB_OK";
+        for (int i = 0; i < ack.length(); i++) {
+          sendSlipByte(ack[i]);
+        }
+        Serial.write(SLIP_END);
+      } else {
+        hasThumbnail = false;
+        
+        // Send error
+        Serial.write(SLIP_END);
+        String err = "THUMB_FAIL";
+        for (int i = 0; i < err.length(); i++) {
+          sendSlipByte(err[i]);
+        }
+        Serial.write(SLIP_END);
+      }
+      
+      drawMainScreen();
+      
+      // Flash LED for activity
+      digitalWrite(4, HIGH);
+      delay(100);
+      digitalWrite(4, LOW);
+      
+      // Send success status
+      Serial.write(SLIP_END);
+      String status = "OK";
+      for (int i = 0; i < status.length(); i++) {
+        sendSlipByte(status[i]);
+      }
+      Serial.write(SLIP_END);
+    }
+  }
+}
+
+void sendSlipByte(uint8_t b) {
+  if (b == SLIP_END) {
+    Serial.write(SLIP_ESC);
+    Serial.write(SLIP_ESC_END);
+  } else if (b == SLIP_ESC) {
+    Serial.write(SLIP_ESC);
+    Serial.write(SLIP_ESC_ESC);
   } else {
-    Serial.println("Failed to parse header");
+    Serial.write(b);
   }
 }
 
 void drawMainScreen() {
-  Serial.println("Drawing main screen...");
   tft.fillScreen(TFT_BLACK);
   
-  // Draw thumbnail
+  // Draw thumbnail (centered, 80x80)
   int thumbX = (tft.width() - 80) / 2;
   int thumbY = 10;
   
   if (hasThumbnail) {
-    Serial.println("Drawing thumbnail from buffer...");
-    
-    // Draw a colored border around thumbnail area to confirm positioning
-    tft.drawRect(thumbX - 1, thumbY - 1, 82, 82, TFT_RED);
-    
-    // Draw the RGB565 image
+    // Draw RGB565 image
     for (int y = 0; y < 80; y++) {
       for (int x = 0; x < 80; x++) {
         int idx = (y * 80 + x) * 2;
@@ -194,12 +238,8 @@ void drawMainScreen() {
         }
       }
     }
-    Serial.println("Thumbnail drawing complete");
-    
-    // Draw a test pattern to verify display working
-    tft.fillRect(thumbX + 30, thumbY + 30, 20, 20, TFT_RED);
   } else {
-    Serial.println("No thumbnail, drawing placeholder");
+    // Draw placeholder
     tft.fillRect(thumbX, thumbY, 80, 80, TFT_DARKGREY);
     tft.drawRect(thumbX, thumbY, 80, 80, TFT_WHITE);
     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -215,7 +255,7 @@ void drawMainScreen() {
   tft.setTextSize(2);
   tft.setCursor(10, 110);
   
-  String displayTitle = currentTitle;
+  String displayTitle = fullTitle;
   if (displayTitle.length() > 24) {
     displayTitle = displayTitle.substring(0, 22) + "...";
   }
@@ -239,6 +279,14 @@ void drawMainScreen() {
   int barHeight = 8;
   tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
   
+  // Draw progress
+  if (currentDuration > 0) {
+    int progressWidth = (currentPosition * barWidth) / currentDuration;
+    if (progressWidth > 0) {
+      tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
+    }
+  }
+  
   // Time text
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -250,16 +298,10 @@ void drawMainScreen() {
   tft.setTextColor(TFT_WHITE, TFT_NAVY);
   tft.setCursor(10, tft.height() - 18);
   tft.println("♪ NOW PLAYING ♪");
-  
-  Serial.println("Screen draw complete");
 }
 
 void updateProgressDisplay() {
   static int lastPosition = -1;
-  static unsigned long lastUpdate = 0;
-  
-  if (millis() - lastUpdate < 500) return;
-  lastUpdate = millis();
   
   if (currentPosition != lastPosition && currentDuration > 0) {
     int barWidth = tft.width() - 20;
@@ -269,18 +311,36 @@ void updateProgressDisplay() {
     
     int progressWidth = (currentPosition * barWidth) / currentDuration;
     
-    // Update progress bar
     tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
     if (progressWidth > 0) {
       tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
     }
     
-    // Update time
     tft.fillRect(10, 195, 150, 15, TFT_BLACK);
     tft.setCursor(10, 195);
     tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
     
     lastPosition = currentPosition;
+  }
+}
+
+void updateScrollingText() {
+  if (fullTitle.length() > 24) {
+    static unsigned long lastScroll = 0;
+    if (millis() - lastScroll > 200) {
+      scrollOffset++;
+      if (scrollOffset > fullTitle.length() - 24) {
+        scrollOffset = 0;
+      }
+      lastScroll = millis();
+      
+      String displayTitle = fullTitle.substring(scrollOffset, scrollOffset + 24);
+      tft.fillRect(10, 105, tft.width() - 20, 25, TFT_BLACK);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(10, 110);
+      tft.println(displayTitle);
+    }
   }
 }
 
