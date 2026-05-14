@@ -71,13 +71,14 @@ namespace MusicToArduino
                     if (songData != null)
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
-                        if (currentKey != _lastSongKey && (DateTime.Now - _lastSendTime) >= _minSendInterval)
+                        if ((DateTime.Now - _lastSendTime) >= _minSendInterval)
                         {
                             _lastSongKey = currentKey;
                             _lastSendTime = DateTime.Now;
                             await SendToArduinoWithRetry(songData);
                             Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] ✓ {songData.Title} - {songData.Artist}");
                         }
+
                     }
                     await Task.Delay(1000);
                 }

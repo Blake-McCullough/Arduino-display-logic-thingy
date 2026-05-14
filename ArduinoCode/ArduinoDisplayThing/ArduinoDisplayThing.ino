@@ -6,6 +6,9 @@ String currentTitle = "Waiting...";
 String currentArtist = "";
 int currentDuration = 0;
 int currentPosition = 0;
+unsigned long lastDataReceived = 0;
+unsigned long lastPositionUpdate = 0;
+bool isPlaying = false;
 
 #define THUMBNAIL_SIZE 12800
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
@@ -21,6 +24,10 @@ enum State {
 State currentState = WAITING_FOR_START;
 String metadataBuffer = "";
 int thumbnailBytesRead = 0;
+
+// Timeout settings
+#define DATA_TIMEOUT_MS 30000  // 30 seconds timeout
+#define POSITION_UPDATE_INTERVAL_MS 1000  // Update position every second
 
 void setup() {
   Serial.begin(115200);
@@ -44,6 +51,7 @@ void setup() {
   }
   
   Serial.println("Ready to receive data");
+  lastDataReceived = millis();
 }
 
 void drawWaitingScreen() {
@@ -57,15 +65,39 @@ void drawWaitingScreen() {
 }
 
 void loop() {
-  if (Serial.available()) {
-    processIncomingData();
+  // Check for timeout - if no data received for 30 seconds, reset to waiting state
+  if (millis() - lastDataReceived > DATA_TIMEOUT_MS) {
+    if (currentState != WAITING_FOR_START) {
+      Serial.println("Data timeout - resetting to waiting state");
+      resetToWaitingState();
+    }
   }
   
-  if (currentDuration > 0) {
-    updateProgressDisplay();
+  if (Serial.available()) {
+    processIncomingData();
+    lastDataReceived = millis(); // Reset timeout on any data received
+  }
+  
+  // Update position if we have a song
+  if (currentDuration > 0 && isPlaying) {
+    updatePosition();
   }
   
   delay(10);
+}
+
+void resetToWaitingState() {
+  currentState = WAITING_FOR_START;
+  metadataBuffer = "";
+  thumbnailBytesRead = 0;
+  hasThumbnail = false;
+  isPlaying = false;
+  currentDuration = 0;
+  currentPosition = 0;
+  currentTitle = "Waiting...";
+  currentArtist = "";
+  drawWaitingScreen();
+  Serial.println("Reset complete - waiting for new song");
 }
 
 void processIncomingData() {
@@ -102,6 +134,10 @@ void processIncomingData() {
           if (thumbnailBytesRead == THUMBNAIL_SIZE) {
             hasThumbnail = true;
             currentState = WAITING_FOR_START;
+            isPlaying = true;
+            lastPositionUpdate = millis();
+            lastDataReceived = millis();
+            
             Serial.println("Thumbnail received complete!");
             
             // Draw the screen with new data
@@ -120,6 +156,31 @@ void processIncomingData() {
   }
 }
 
+void updatePosition() {
+  unsigned long currentTime = millis();
+  
+  // Update position every second
+  if (currentTime - lastPositionUpdate >= POSITION_UPDATE_INTERVAL_MS) {
+    // Increment position by 1 second
+    if (currentPosition < currentDuration) {
+      currentPosition++;
+      lastPositionUpdate = currentTime;
+      
+      // Update the display
+      updateProgressDisplay();
+      
+      // Check if song has ended
+      if (currentPosition >= currentDuration) {
+        Serial.println("Song ended");
+        isPlaying = false;
+        
+        // Optional: Reset to waiting state after song ends
+        // resetToWaitingState();
+      }
+    }
+  }
+}
+
 void parseMetadata(String metadata) {
   Serial.print("Metadata: ");
   Serial.println(metadata);
@@ -133,6 +194,10 @@ void parseMetadata(String metadata) {
     currentArtist = metadata.substring(firstPipe + 1, secondPipe);
     currentDuration = metadata.substring(secondPipe + 1, thirdPipe).toInt();
     currentPosition = metadata.substring(thirdPipe + 1).toInt();
+    
+    // Reset position tracking
+    lastPositionUpdate = millis();
+    isPlaying = true;
     
     Serial.println("Parsed values:");
     Serial.print("  Title: ");
@@ -210,6 +275,14 @@ void drawMainScreen() {
   int barHeight = 8;
   tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
   
+  // Initial progress bar
+  if (currentDuration > 0) {
+    int progressWidth = (currentPosition * barWidth) / currentDuration;
+    if (progressWidth > 0) {
+      tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
+    }
+  }
+  
   // Time text
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -226,30 +299,39 @@ void drawMainScreen() {
 }
 
 void updateProgressDisplay() {
-  static int lastPosition = -1;
-  static unsigned long lastUpdate = 0;
+  static int lastDisplayedPosition = -1;
   
-  if (millis() - lastUpdate < 500) return;
-  lastUpdate = millis();
-  
-  if (currentPosition != lastPosition && currentDuration > 0) {
+  // Only update if position has changed
+  if (currentPosition != lastDisplayedPosition && currentDuration > 0) {
     int barWidth = tft.width() - 20;
     int barX = 10;
     int barY = 175;
     int barHeight = 8;
     
+    // Calculate progress
     int progressWidth = (currentPosition * barWidth) / currentDuration;
     
+    // Update progress bar
     tft.fillRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
     if (progressWidth > 0) {
       tft.fillRect(barX, barY, progressWidth, barHeight, TFT_GREEN);
     }
     
+    // Update time text
     tft.fillRect(10, 195, 150, 15, TFT_BLACK);
     tft.setCursor(10, 195);
     tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
     
-    lastPosition = currentPosition;
+    lastDisplayedPosition = currentPosition;
+    
+    // Optional: Print debug info occasionally
+    static int debugCounter = 0;
+    if (debugCounter++ % 10 == 0) {
+      Serial.print("Position updated: ");
+      Serial.print(currentPosition);
+      Serial.print("/");
+      Serial.println(currentDuration);
+    }
   }
 }
 
