@@ -89,7 +89,7 @@ void setup() {
   digitalWrite(21, HIGH);
   
   tft.init();
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   tft.invertDisplay(true);
   
