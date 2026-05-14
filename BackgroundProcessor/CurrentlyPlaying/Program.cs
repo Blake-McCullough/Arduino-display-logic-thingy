@@ -156,7 +156,7 @@ namespace MusicToArduino
                 }
 
                 // Prepare metadata string with newline terminator
-                string metadata = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}\n";
+                string metadata = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|{data.Source}\n";
                 byte[] metadataBytes = System.Text.Encoding.UTF8.GetBytes(metadata);
 
                 // Get thumbnail data
@@ -201,12 +201,25 @@ namespace MusicToArduino
             {
                 var sessionManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
                 var currentSession = sessionManager.GetCurrentSession();
+                //currentSession.SourceAppUserModelId
                 if (currentSession == null) return null;
 
                 var mediaProperties = await currentSession.TryGetMediaPropertiesAsync();
                 if (string.IsNullOrWhiteSpace(mediaProperties.Title)) return null;
 
                 var timelineProperties = currentSession.GetTimelineProperties();
+                var playbackPropetires = currentSession.GetPlaybackInfo();
+
+                bool isPlaying = playbackPropetires.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+
+                // Get the source app ID
+                string sourceApp = currentSession.SourceAppUserModelId ?? "Unknown Source";
+                // Clean up the source string (remove common prefixes)
+                if (sourceApp.Contains("!"))
+                {
+                    sourceApp = sourceApp.Substring(sourceApp.LastIndexOf('!') + 1);
+                }
+                sourceApp = sourceApp.Replace("Microsoft.", "").Replace("Spotify", "Spotify").Replace("AppleInc.", "Apple ");
 
                 string title = mediaProperties.Title.Replace("|", "").Trim();
                 string artist = (mediaProperties.Artist ?? "Unknown Artist").Replace("|", "").Trim();
@@ -232,6 +245,7 @@ namespace MusicToArduino
                     Artist = artist,
                     Duration = (int)timelineProperties.EndTime.TotalSeconds,
                     Position = (int)timelineProperties.Position.TotalSeconds,
+                    Source = sourceApp,
                     Thumbnail = thumbnailBytes ?? CreateTestThumbnail()
                 };
             }
@@ -327,6 +341,7 @@ namespace MusicToArduino
         public string Artist { get; set; }
         public int Duration { get; set; }
         public int Position { get; set; }
+        public string Source { get; set; }
         public byte[] Thumbnail { get; set; }
     }
 }

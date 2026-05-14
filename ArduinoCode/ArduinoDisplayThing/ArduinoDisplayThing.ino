@@ -4,6 +4,7 @@ TFT_eSPI tft = TFT_eSPI();
 
 String currentTitle = "Waiting...";
 String currentArtist = "";
+String currentSource = "";
 int currentDuration = 0;
 int currentPosition = 0;
 unsigned long lastDataReceived = 0;
@@ -96,6 +97,7 @@ void resetToWaitingState() {
   currentPosition = 0;
   currentTitle = "Waiting...";
   currentArtist = "";
+  currentSource = "";
   drawWaitingScreen();
   Serial.println("Reset complete - waiting for new song");
 }
@@ -173,9 +175,6 @@ void updatePosition() {
       if (currentPosition >= currentDuration) {
         Serial.println("Song ended");
         isPlaying = false;
-        
-        // Optional: Reset to waiting state after song ends
-        // resetToWaitingState();
       }
     }
   }
@@ -185,15 +184,25 @@ void parseMetadata(String metadata) {
   Serial.print("Metadata: ");
   Serial.println(metadata);
   
+  // Parse 5 fields now (including source)
   int firstPipe = metadata.indexOf('|');
   int secondPipe = metadata.indexOf('|', firstPipe + 1);
   int thirdPipe = metadata.indexOf('|', secondPipe + 1);
+  int fourthPipe = metadata.indexOf('|', thirdPipe + 1);
   
-  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0) {
+  if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0) {
     currentTitle = metadata.substring(0, firstPipe);
     currentArtist = metadata.substring(firstPipe + 1, secondPipe);
     currentDuration = metadata.substring(secondPipe + 1, thirdPipe).toInt();
-    currentPosition = metadata.substring(thirdPipe + 1).toInt();
+    currentPosition = metadata.substring(thirdPipe + 1, fourthPipe).toInt();
+    currentSource = metadata.substring(fourthPipe + 1);
+    
+    // Clean up source string (remove common prefixes)
+    currentSource.replace("Microsoft.", "");
+    currentSource.replace("AppleInc.", "Apple ");
+    if (currentSource.length() > 15) {
+      currentSource = currentSource.substring(0, 12) + "...";
+    }
     
     // Reset position tracking
     lastPositionUpdate = millis();
@@ -208,6 +217,8 @@ void parseMetadata(String metadata) {
     Serial.println(currentDuration);
     Serial.print("  Position: ");
     Serial.println(currentPosition);
+    Serial.print("  Source: ");
+    Serial.println(currentSource);
   } else {
     Serial.println("Failed to parse metadata!");
   }
@@ -283,17 +294,21 @@ void drawMainScreen() {
     }
   }
   
-  // Time text
+  // Time text (left side)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
   tft.setCursor(10, 195);
   tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
   
-  // Footer
-  tft.fillRect(0, tft.height() - 25, tft.width(), 25, TFT_NAVY);
-  tft.setTextColor(TFT_WHITE, TFT_NAVY);
-  tft.setCursor(10, tft.height() - 18);
-  tft.println("♪ NOW PLAYING ♪");
+  // Source text (right side)
+  if (currentSource.length() > 0) {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextSize(1);
+    int sourceX = tft.width() - 10 - (currentSource.length() * 6); // Approximate width
+    if (sourceX < 120) sourceX = 120; // Don't overlap with time
+    tft.setCursor(sourceX, 195);
+    tft.println(currentSource);
+  }
   
   Serial.println("Screen draw complete");
 }
@@ -318,7 +333,7 @@ void updateProgressDisplay() {
     }
     
     // Update time text
-    tft.fillRect(10, 195, 150, 15, TFT_BLACK);
+    tft.fillRect(10, 195, 100, 15, TFT_BLACK);
     tft.setCursor(10, 195);
     tft.println(formatTime(currentPosition) + " / " + formatTime(currentDuration));
     
