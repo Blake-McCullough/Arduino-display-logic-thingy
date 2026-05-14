@@ -10,6 +10,7 @@ namespace MusicToArduino
     {
         private readonly ILogger<MusicToArduinoService> _logger;
         private SerialPort? _serialPort;
+        private bool _lastIsPlaying = false;
         private string _lastSongKey = "";
         private DateTime _lastSendTime = DateTime.MinValue;
         private TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
@@ -171,13 +172,18 @@ MinIntervalSeconds=3
                     if (songData != null)
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
+                        bool currentIsPlaying = songData.IsPlaying;
                         //If isnt the same and has been 3 seconds since last check, otherwise if has been min time then do it.
                         if (
                             (_lastSongKey != currentKey && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
                             ||
+                            //If current playing status has changed, then we go for it.
+                            (_lastIsPlaying != currentIsPlaying && (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3))
+                            ||
                             ((DateTime.Now - _lastSendTime) >= _minSendInterval)
                             )
                         {
+                            _lastIsPlaying = currentIsPlaying;
                             _lastSongKey = currentKey;
                             _lastSendTime = DateTime.Now;
 
