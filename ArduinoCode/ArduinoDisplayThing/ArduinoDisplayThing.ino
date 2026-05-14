@@ -11,6 +11,7 @@ int currentPosition = 0;
 int initialPosition = 0;
 bool isPlaying = false;
 bool hasValidSong = false;
+bool songEnded = false;  // New flag to track if song has ended
 
 // Previous values for change detection
 String lastTitle = "";
@@ -118,6 +119,7 @@ void showWaitingScreen() {
   hasValidSong = false;
   currentSongKey = "";
   lastSongKey = "";
+  songEnded = false;
 }
 
 void renderFullScreen() {
@@ -171,11 +173,14 @@ void renderFullScreen() {
     tft.println(currentSource);
   }
   
-  // Draw initial time and progress
+  // Draw progress bar and time FIRST
   updateProgressAndTime();
+  
+  // Draw play/pause state LAST so it appears on top
   updatePlayPauseState();
   
   hasValidSong = true;
+  songEnded = false;
 }
 
 void initScrollingText() {
@@ -290,19 +295,19 @@ void loop() {
     updateScrolling();
   }
   
-  // Update position based on actual elapsed time
-  if (hasValidSong && currentDuration > 0) {
+  // Update position based on actual elapsed time (only if song hasn't ended)
+  if (hasValidSong && currentDuration > 0 && !songEnded) {
     updatePositionFromTime();
   }
   
   delay(10);
 }
-
 void updatePositionFromTime() {
   if (!isPlaying) {
     // Not playing, just update display if needed
     if (millis() - lastPositionUpdate > POSITION_UPDATE_INTERVAL_MS) {
-      updateProgressAndTime();
+      updateProgressAndTime();     // Update progress bar first
+      updatePlayPauseState();      // Then update PAUSED text on top
       lastPositionUpdate = millis();
     }
     return;
@@ -313,35 +318,44 @@ void updatePositionFromTime() {
   unsigned long elapsedMillis = currentMillis - songStartTime;
   int elapsedSeconds = elapsedMillis / 1000;
   
-  // Calculate current position (initial position + elapsed seconds - total paused time)
+  // Calculate current position (initial position + elapsed seconds)
   int calculatedPosition = initialPosition + elapsedSeconds;
   
   // Clamp to duration
-  if (calculatedPosition > currentDuration) {
+  if (calculatedPosition >= currentDuration) {
     calculatedPosition = currentDuration;
+    
+    // Song has ended - stop counting time but don't change play state
+    if (!songEnded) {
+      songEnded = true;
+      Serial.println("Song reached end - stopping time tracking");
+      updateProgressAndTime();     // Final update to show full progress bar
+      updatePlayPauseState();      // Update to show ended state (no PAUSED text)
+    }
   }
   
-  // Update position if changed
-  if (calculatedPosition != currentPosition) {
+  // Update position if changed and song hasn't ended
+  if (calculatedPosition != currentPosition && !songEnded) {
     currentPosition = calculatedPosition;
     lastPositionUpdate = currentMillis;
-    updateProgressAndTime();
-    
-    // Check if song ended
-    if (currentPosition >= currentDuration) {
-      Serial.println("Song ended");
-      isPlaying = false;
-      updatePlayPauseState();
-    }
-  } else if (millis() - lastPositionUpdate > POSITION_UPDATE_INTERVAL_MS) {
+    updateProgressAndTime();       // Update progress bar first
+    updatePlayPauseState();        // Then update PAUSED text on top
+  } else if (millis() - lastPositionUpdate > POSITION_UPDATE_INTERVAL_MS && !songEnded) {
     // Update display periodically even if position hasn't changed (for smoother progress bar)
-    updateProgressAndTime();
+    updateProgressAndTime();       // Update progress bar first
+    updatePlayPauseState();        // Then update PAUSED text on top
     lastPositionUpdate = currentMillis;
   }
 }
 
 void handlePlayStateChange(bool newPlayingState) {
   if (newPlayingState == isPlaying) return;
+  
+  // Don't allow play/pause changes if song has ended
+  if (songEnded) {
+    Serial.println("Song has ended - ignoring play/pause change");
+    return;
+  }
   
   isPlaying = newPlayingState;
   
@@ -383,6 +397,7 @@ void resetToWaitingState() {
   lastPauseTime = 0;
   titleScrollPos = 0;
   artistScrollPos = 0;
+  songEnded = false;
 }
 
 void processIncomingData() {
@@ -432,11 +447,18 @@ void processIncomingData() {
               songStartTime = millis();
               initialPosition = currentPosition;
               lastPauseTime = 0;
+              songEnded = false;
               
               renderFullScreen();
             } else {
               // Same song - just update timing and progress
               Serial.println("Same song - updating timing");
+              
+              // Reset song ended flag if we're getting new data for the same song
+              if (songEnded) {
+                songEnded = false;
+                Serial.println("Song reset - new data received");
+              }
               
               // Update timing for existing song
               if (isPlaying) {
@@ -498,7 +520,10 @@ void parseMetadata(String metadata) {
     currentArtist = newArtist;
     currentDuration = newDuration;
     currentSource = newSource;
-    
+         // For new song, use the position from metadata
+      currentPosition = newPosition;
+      initialPosition = newPosition;
+      
     // Clean up source string
     currentSource.replace("Microsoft.", "");
     currentSource.replace("AppleInc.", "Apple ");
@@ -507,13 +532,12 @@ void parseMetadata(String metadata) {
     }
     
     if (isNewSong) {
-      // For new song, use the position from metadata
-      currentPosition = newPosition;
-      initialPosition = newPosition;
+ 
+      songEnded = false;
       handlePlayStateChange(newPlayingState);
     } else {
       // For same song, just update play state and adjust timing
-      if (newPlayingState != isPlaying) {
+      if (newPlayingState != isPlaying && !songEnded) {
         handlePlayStateChange(newPlayingState);
       }
       // Don't update position from PC for same song - let millis() handle it
@@ -534,6 +558,8 @@ void parseMetadata(String metadata) {
     Serial.println(isPlaying ? "Yes" : "No");
     Serial.print("  IsNewSong: ");
     Serial.println(isNewSong ? "Yes" : "No");
+    Serial.print("  SongEnded: ");
+    Serial.println(songEnded ? "Yes" : "No");
   } else {
     Serial.println("Failed to parse metadata!");
   }
@@ -545,7 +571,7 @@ void updateProgressAndTime() {
   if (currentDuration > 0) {
     int progressWidth = (currentPosition * BAR_WIDTH) / currentDuration;
     
-    // Update progress bar
+    // Update progress bar (always update the bar)
     tft.fillRect(BAR_X, BAR_Y, BAR_WIDTH, BAR_HEIGHT, TFT_DARKGREY);
     if (progressWidth > 0) {
       tft.fillRect(BAR_X, BAR_Y, progressWidth, BAR_HEIGHT, TFT_GREEN);
@@ -560,20 +586,26 @@ void updateProgressAndTime() {
   }
 }
 
+
 void updatePlayPauseState() {
   if (!hasValidSong) return;
   
-  // Clear the area where PAUSED text appears
+  // Clear the area where PAUSED text appears (but don't clear progress bar)
   tft.fillRect(BAR_X, BAR_Y - 12, BAR_WIDTH, 12, TFT_BLACK);
   
-  if (!isPlaying && currentPosition < currentDuration) {
-    // Show PAUSED text
+  // Only show PAUSED if:
+  // 1. Song hasn't ended
+  // 2. Not playing
+  // 3. Position hasn't reached the end
+  if (!songEnded && !isPlaying && currentPosition < currentDuration) {
+    // Show PAUSED text - draw it AFTER progress bar so it's on top
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.setTextSize(1);
     tft.setCursor(BAR_X + (BAR_WIDTH / 2) - 30, BAR_Y - 2);
     tft.println("PAUSED");
   }
 }
+
 
 String formatTime(int seconds) {
   if (seconds < 0) seconds = 0;
