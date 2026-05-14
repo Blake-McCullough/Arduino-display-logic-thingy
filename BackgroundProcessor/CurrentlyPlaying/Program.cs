@@ -57,6 +57,8 @@ namespace MusicToArduino
 
         static async Task MonitorMusic()
         {
+            _ = Task.Run(() => ReadArduinoOutput());
+
             while (true)
             {
                 try
@@ -82,6 +84,32 @@ namespace MusicToArduino
                 }
             }
         }
+        static async Task ReadArduinoOutput()
+        {
+            try
+            {
+                while (_serialPort != null && _serialPort.IsOpen)
+                {
+                    if (_serialPort.BytesToRead > 0)
+                    {
+                        string line = _serialPort.ReadLine();
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            // Format Arduino output nicely
+                            Console.ForegroundColor = ConsoleColor.DarkGray;
+                            Console.WriteLine($"[ARDUINO] {line}");
+                            Console.ResetColor();
+                        }
+                    }
+                    await Task.Delay(10);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error reading from Arduino: {ex.Message}");
+            }
+        }
+
 
         static async Task<SongData> GetCurrentSongData()
         {
