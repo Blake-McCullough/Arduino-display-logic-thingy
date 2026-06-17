@@ -15,12 +15,16 @@ namespace MusicToArduino
         private DateTime _lastSendTime = DateTime.MinValue;
         private TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
         private readonly object _serialLock = new object();
+        private bool _isReconnecting = false;
+        private readonly Random _random = new Random();
 
         // Configuration
         private string? _comPort;
         private int _baudRate;
         private const int MAX_RETRIES = 3;
         private const string CONFIG_FILE = "MusicToArduino.config";
+        private const int MIN_RECONNECT_DELAY_SECONDS = 5;
+        private const int MAX_RECONNECT_DELAY_SECONDS = 10;
 
         public MusicToArduinoService(ILogger<MusicToArduinoService> logger)
         {
@@ -38,19 +42,13 @@ namespace MusicToArduino
                 return;
             }
 
-            // Initialize serial port
-            if (!InitializeSerialPort())
-            {
-                _logger.LogError("Failed to initialize serial port. Service will stop.");
-                return;
-            }
-
             // Start monitoring tasks
             var monitorTask = MonitorMusicAsync(stoppingToken);
             var readTask = ReadArduinoOutputAsync(stoppingToken);
+            var reconnectTask = MonitorAndReconnectAsync(stoppingToken);
 
             // Wait for either task to complete (they should run until cancelled)
-            await Task.WhenAny(monitorTask, readTask);
+            await Task.WhenAny(monitorTask, readTask, reconnectTask);
 
             _logger.LogInformation("MusicToArduino Service stopping...");
 
@@ -148,17 +146,191 @@ MinIntervalSeconds=3
         {
             try
             {
-                _serialPort = new SerialPort(_comPort, _baudRate, Parity.None, 8, StopBits.One);
-                _serialPort.ReadTimeout = 1000;
-                _serialPort.WriteTimeout = 1000;
-                _serialPort.Open();
-                _logger.LogInformation($"Serial port {_comPort} opened successfully");
-                return true;
+                lock (_serialLock)
+                {
+                    // Dispose existing port if any
+                    if (_serialPort != null)
+                    {
+                        if (_serialPort.IsOpen)
+                            _serialPort.Close();
+                        _serialPort.Dispose();
+                    }
+
+                    _serialPort = new SerialPort(_comPort, _baudRate, Parity.None, 8, StopBits.One);
+                    _serialPort.ReadTimeout = 1000;
+                    _serialPort.WriteTimeout = 1000;
+                    _serialPort.Open();
+
+                    // Clear buffers
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.DiscardOutBuffer();
+
+                    _logger.LogInformation($"Serial port {_comPort} opened successfully");
+                    return true;
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Failed to open serial port {_comPort}");
                 return false;
+            }
+        }
+
+        private async Task MonitorAndReconnectAsync(CancellationToken stoppingToken)
+        {
+            // Initial connection attempt
+            bool initialConnected = false;
+            while (!stoppingToken.IsCancellationRequested && !initialConnected)
+            {
+                _logger.LogInformation($"Attempting initial connection to {_comPort}...");
+                if (InitializeSerialPort())
+                {
+                    initialConnected = true;
+                    _logger.LogInformation("Initial connection successful!");
+                    break;
+                }
+
+                int delay = _random.Next(MIN_RECONNECT_DELAY_SECONDS, MAX_RECONNECT_DELAY_SECONDS + 1);
+                _logger.LogWarning($"Initial connection failed. Retrying in {delay} seconds...");
+                await Task.Delay(TimeSpan.FromSeconds(delay), stoppingToken);
+            }
+
+            // Continuously monitor connection
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    bool isConnected = false;
+                    lock (_serialLock)
+                    {
+                        isConnected = _serialPort != null && _serialPort.IsOpen;
+                    }
+
+                    if (!isConnected && !_isReconnecting)
+                    {
+                        _logger.LogWarning("Serial port is disconnected. Attempting to reconnect...");
+                        await AttemptReconnectAsync(stoppingToken);
+                    }
+                    else if (isConnected)
+                    {
+                        // Check connection health
+                        await CheckConnectionHealthAsync(stoppingToken);
+                    }
+
+                    // Check every 2 seconds for connection issues
+                    await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error in connection monitor");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
+            }
+        }
+
+        private async Task CheckConnectionHealthAsync(CancellationToken stoppingToken)
+        {
+            try
+            {
+                bool isHealthy = false;
+                lock (_serialLock)
+                {
+                    if (_serialPort != null && _serialPort.IsOpen)
+                    {
+                        try
+                        {
+                            // Try a simple write to check if the port is responsive
+                            _serialPort.Write("P"); // Ping command
+                            isHealthy = true;
+                        }
+                        catch (Exception)
+                        {
+                            // Connection is unhealthy
+                            isHealthy = false;
+                        }
+                    }
+                }
+
+                if (!isHealthy)
+                {
+                    _logger.LogWarning("Serial port health check failed. Closing and will reconnect.");
+                    lock (_serialLock)
+                    {
+                        if (_serialPort != null && _serialPort.IsOpen)
+                        {
+                            try
+                            {
+                                _serialPort.Close();
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Health check error");
+            }
+        }
+
+        private async Task AttemptReconnectAsync(CancellationToken stoppingToken)
+        {
+            if (_isReconnecting) return;
+
+            _isReconnecting = true;
+            try
+            {
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    // Generate random delay between 5-10 seconds
+                    int delay = _random.Next(MIN_RECONNECT_DELAY_SECONDS, MAX_RECONNECT_DELAY_SECONDS + 1);
+                    _logger.LogInformation($"Waiting {delay} seconds before reconnect attempt...");
+                    await Task.Delay(TimeSpan.FromSeconds(delay), stoppingToken);
+
+                    if (stoppingToken.IsCancellationRequested)
+                        break;
+
+                    _logger.LogInformation("Attempting to reconnect...");
+
+                    // Close and dispose existing port
+                    lock (_serialLock)
+                    {
+                        if (_serialPort != null)
+                        {
+                            if (_serialPort.IsOpen)
+                                _serialPort.Close();
+                            _serialPort.Dispose();
+                            _serialPort = null;
+                        }
+                    }
+
+                    // Try to reconnect
+                    if (InitializeSerialPort())
+                    {
+                        _logger.LogInformation("Reconnection successful!");
+                        break;
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Reconnection failed. Will retry again...");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal shutdown
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during reconnection attempt");
+            }
+            finally
+            {
+                _isReconnecting = false;
             }
         }
 
@@ -168,22 +340,32 @@ MinIntervalSeconds=3
             {
                 try
                 {
+                    // Check if serial port is connected before attempting to send
+                    bool isConnected = false;
+                    lock (_serialLock)
+                    {
+                        isConnected = _serialPort != null && _serialPort.IsOpen;
+                    }
+
+                    if (!isConnected)
+                    {
+                        // Wait and try again later
+                        await Task.Delay(1000, stoppingToken);
+                        continue;
+                    }
+
                     var songData = await GetCurrentSongDataAsync();
                     if (songData != null)
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
                         bool currentIsPlaying = songData.IsPlaying;
-                        //If isnt the same and has been 3 seconds since last check, otherwise if has been min time then do it.
+
+                        // Calculate cooldown
                         bool hasBeenCooldownTime = (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3);
-                        if (
-                            (_lastSongKey != currentKey && hasBeenCooldownTime)
-                            ||
-                            //If current playing status has changed, then we go for it.
-                            (_lastIsPlaying != currentIsPlaying && hasBeenCooldownTime)
-                            ||
-                            //Otherwise just send a "Hey we updated" every like 15 seconds or whatever config says.
-                            ((DateTime.Now - _lastSendTime) >= _minSendInterval)
-                            )
+
+                        if ((_lastSongKey != currentKey && hasBeenCooldownTime) ||
+                            (_lastIsPlaying != currentIsPlaying && hasBeenCooldownTime) ||
+                            ((DateTime.Now - _lastSendTime) >= _minSendInterval))
                         {
                             _lastIsPlaying = currentIsPlaying;
                             _lastSongKey = currentKey;
@@ -193,6 +375,22 @@ MinIntervalSeconds=3
                             if (success)
                             {
                                 _logger.LogInformation($"Sent: {songData.Title} - {songData.Artist}");
+                            }
+                            else
+                            {
+                                _logger.LogWarning("Failed to send data to Arduino - connection may be lost");
+                                // Mark connection as failed so reconnection triggers
+                                lock (_serialLock)
+                                {
+                                    if (_serialPort != null && _serialPort.IsOpen)
+                                    {
+                                        try
+                                        {
+                                            _serialPort.Close();
+                                        }
+                                        catch { }
+                                    }
+                                }
                             }
                         }
                     }
@@ -216,21 +414,46 @@ MinIntervalSeconds=3
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
+                    bool canRead = false;
                     lock (_serialLock)
                     {
-                        if (_serialPort != null && _serialPort.IsOpen && _serialPort.BytesToRead > 0)
+                        canRead = _serialPort != null && _serialPort.IsOpen && _serialPort.BytesToRead > 0;
+                    }
+
+                    if (canRead)
+                    {
+                        try
                         {
-                            try
+                            lock (_serialLock)
                             {
-                                string line = _serialPort.ReadLine();
-                                if (!string.IsNullOrWhiteSpace(line))
+                                if (_serialPort != null && _serialPort.IsOpen)
                                 {
-                                    _logger.LogInformation($"[ARDUINO] {line}");
+                                    string line = _serialPort.ReadLine();
+                                    if (!string.IsNullOrWhiteSpace(line))
+                                    {
+                                        _logger.LogInformation($"[ARDUINO] {line}");
+                                    }
                                 }
                             }
-                            catch (TimeoutException)
+                        }
+                        catch (TimeoutException)
+                        {
+                            // Normal timeout, just continue
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error reading from Arduino - connection may be lost");
+                            // Mark for reconnection
+                            lock (_serialLock)
                             {
-                                // Normal timeout, just continue
+                                if (_serialPort != null && _serialPort.IsOpen)
+                                {
+                                    try
+                                    {
+                                        _serialPort.Close();
+                                    }
+                                    catch { }
+                                }
                             }
                         }
                     }
@@ -258,7 +481,8 @@ MinIntervalSeconds=3
 
                 if (attempt < MAX_RETRIES)
                 {
-                    await Task.Delay(1000);
+                    _logger.LogWarning($"Send attempt {attempt} failed. Retrying...");
+                    await Task.Delay(1000 * attempt);
                 }
             }
             return false;
@@ -375,9 +599,9 @@ MinIntervalSeconds=3
                     }
 
                     using (var ms = new MemoryStream(rawBytes))
-                    using (var originalImage = Image.FromStream(ms))
-                    using (var resizedBitmap = new Bitmap(80, 80))
-                    using (var graphics = Graphics.FromImage(resizedBitmap))
+                    using (var originalImage = System.Drawing.Image.FromStream(ms))
+                    using (var resizedBitmap = new System.Drawing.Bitmap(80, 80))
+                    using (var graphics = System.Drawing.Graphics.FromImage(resizedBitmap))
                     {
                         graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                         graphics.DrawImage(originalImage, 0, 0, 80, 80);
@@ -388,7 +612,7 @@ MinIntervalSeconds=3
                         {
                             for (int x = 0; x < 80; x++)
                             {
-                                Color pixel = resizedBitmap.GetPixel(x, y);
+                                System.Drawing.Color pixel = resizedBitmap.GetPixel(x, y);
                                 int r = (pixel.R >> 3) & 0x1F;
                                 int g = (pixel.G >> 2) & 0x3F;
                                 int b = (pixel.B >> 3) & 0x1F;
@@ -426,29 +650,6 @@ MinIntervalSeconds=3
                 }
             }
             return rgb565;
-        }
-
-        private void AttemptReconnect()
-        {
-            try
-            {
-                lock (_serialLock)
-                {
-                    if (_serialPort != null)
-                    {
-                        if (_serialPort.IsOpen)
-                            _serialPort.Close();
-                        _serialPort.Dispose();
-                    }
-
-                    InitializeSerialPort();
-                    _logger.LogInformation("Serial port reconnected successfully");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to reconnect serial port");
-            }
         }
     }
 
