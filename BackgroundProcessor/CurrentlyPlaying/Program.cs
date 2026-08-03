@@ -12,22 +12,15 @@ namespace MusicToArduino
 
         static async Task Main(string[] args)
         {
-            // Try to create a named mutex
             bool createdNew;
             _appMutex = new Mutex(true, MUTEX_NAME, out createdNew);
 
             if (!createdNew)
             {
-                // Another instance is already running - kill it
                 Console.WriteLine("Another instance detected. Terminating the old instance...");
-
-                // Kill the existing process
                 KillExistingInstance();
-
-                // Wait a moment for the old process to terminate
                 await Task.Delay(1000);
 
-                // Now try to create the mutex again
                 _appMutex = new Mutex(true, MUTEX_NAME, out createdNew);
                 if (!createdNew)
                 {
@@ -38,7 +31,6 @@ namespace MusicToArduino
 
             try
             {
-                // Run the application
                 Console.WriteLine("Music To Arduino Bridge starting...");
                 Console.WriteLine("Press Ctrl+C to exit");
 
@@ -57,7 +49,6 @@ namespace MusicToArduino
             }
             finally
             {
-                // Release the mutex when done
                 _appMutex?.ReleaseMutex();
                 _appMutex?.Dispose();
             }
@@ -72,14 +63,12 @@ namespace MusicToArduino
 
                 foreach (var process in Process.GetProcessesByName(currentProcessName))
                 {
-                    // Skip the current process
                     if (process.Id.ToString() == currentProcessId)
                         continue;
 
-                    // Kill the old process
                     Console.WriteLine($"Killing existing process: {process.Id} - {process.ProcessName}");
                     process.Kill();
-                    process.WaitForExit(5000); // Wait up to 5 seconds for it to exit
+                    process.WaitForExit(5000);
                 }
             }
             catch (Exception ex)

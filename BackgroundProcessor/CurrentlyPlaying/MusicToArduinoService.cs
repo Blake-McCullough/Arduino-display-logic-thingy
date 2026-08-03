@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Logging;
 using System.IO;
 using System.IO.Ports;
+using System.Runtime.InteropServices;
 using Windows.Media.Control;
 
 namespace MusicToArduino
@@ -14,13 +15,23 @@ namespace MusicToArduino
         private string _lastSongKey = "";
         private DateTime _lastSendTime = DateTime.MinValue;
         private TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
-        private readonly object _serialLock = new object();
+
+        // Guards every access to _serialPort. A SemaphoreSlim (rather than a
+        // plain lock/object) is used because we need to hold it across
+        // `await` points while a multi-part packet (start marker + metadata
+        // + thumbnail) is being written, so the fast audio-update loop can't
+        // interleave a packet in the middle and desync the Arduino's parser.
+        private readonly SemaphoreSlim _serialSemaphore = new SemaphoreSlim(1, 1);
         private bool _isReconnecting = false;
         private readonly Random _random = new Random();
+
+        private AudioAnalyzer? _audioAnalyzer;
 
         // Configuration
         private string? _comPort;
         private int _baudRate;
+        private bool _enableAudioVisualization = true;
+        private int _audioUpdateIntervalMs = 50; // ~20Hz
         private const int MAX_RETRIES = 3;
         private const string CONFIG_FILE = "MusicToArduino.config";
         private const int MIN_RECONNECT_DELAY_SECONDS = 5;
@@ -35,31 +46,48 @@ namespace MusicToArduino
         {
             _logger.LogInformation("MusicToArduino Service starting...");
 
-            // Load configuration
             if (!LoadConfiguration())
             {
                 _logger.LogError("Failed to load configuration. Service will stop.");
                 return;
             }
 
-            // Start monitoring tasks
-            var monitorTask = MonitorMusicAsync(stoppingToken);
-            var readTask = ReadArduinoOutputAsync(stoppingToken);
-            var reconnectTask = MonitorAndReconnectAsync(stoppingToken);
+            if (_enableAudioVisualization)
+            {
+                _audioAnalyzer = new AudioAnalyzer(_logger);
+                _audioAnalyzer.Start();
+            }
 
-            // Wait for either task to complete (they should run until cancelled)
-            await Task.WhenAny(monitorTask, readTask, reconnectTask);
+            var tasks = new List<Task>
+            {
+                MonitorMusicAsync(stoppingToken),
+                ReadArduinoOutputAsync(stoppingToken),
+                MonitorAndReconnectAsync(stoppingToken)
+            };
+
+            if (_enableAudioVisualization)
+            {
+                tasks.Add(SendAudioDataAsync(stoppingToken));
+            }
+
+            await Task.WhenAny(tasks);
 
             _logger.LogInformation("MusicToArduino Service stopping...");
 
-            // Cleanup
-            lock (_serialLock)
+            _audioAnalyzer?.Dispose();
+
+            await _serialSemaphore.WaitAsync(CancellationToken.None);
+            try
             {
                 if (_serialPort != null && _serialPort.IsOpen)
                 {
                     _serialPort.Close();
                     _serialPort.Dispose();
                 }
+            }
+            finally
+            {
+                _serialSemaphore.Release();
             }
         }
 
@@ -76,7 +104,6 @@ namespace MusicToArduino
                     return false;
                 }
 
-                // Read config file (simple key=value format)
                 string[] lines = File.ReadAllLines(configPath);
                 foreach (string line in lines)
                 {
@@ -94,16 +121,21 @@ namespace MusicToArduino
                                 _comPort = value;
                                 break;
                             case "baudrate":
-                                _baudRate = int.Parse(value);
+                                if (int.TryParse(value, out int baud)) _baudRate = baud;
                                 break;
                             case "minintervalseconds":
-                                _minSendInterval = TimeSpan.FromSeconds(int.Parse(value));
+                                if (int.TryParse(value, out int interval)) _minSendInterval = TimeSpan.FromSeconds(interval);
+                                break;
+                            case "enableaudiovisualization":
+                                if (bool.TryParse(value, out bool enableAudio)) _enableAudioVisualization = enableAudio;
+                                break;
+                            case "audioupdateintervalms":
+                                if (int.TryParse(value, out int audioMs) && audioMs > 0) _audioUpdateIntervalMs = audioMs;
                                 break;
                         }
                     }
                 }
 
-                // Validate configuration
                 if (string.IsNullOrEmpty(_comPort))
                 {
                     _logger.LogError("COM port not specified in configuration file");
@@ -112,7 +144,9 @@ namespace MusicToArduino
 
                 if (_baudRate <= 0) _baudRate = 115200;
 
-                _logger.LogInformation($"Configuration loaded: COM={_comPort}, Baud={_baudRate}, Interval={_minSendInterval.TotalSeconds}s");
+                _logger.LogInformation(
+                    "Configuration loaded: COM={ComPort}, Baud={Baud}, Interval={Interval}s, Audio={Audio}, AudioIntervalMs={AudioMs}",
+                    _comPort, _baudRate, _minSendInterval.TotalSeconds, _enableAudioVisualization, _audioUpdateIntervalMs);
                 return true;
             }
             catch (Exception ex)
@@ -137,6 +171,12 @@ BaudRate=115200
 # Minimum interval between sending song updates (seconds)
 MinIntervalSeconds=3
 
+# Enable/disable real-time audio (volume + frequency band) visualization
+EnableAudioVisualization=true
+
+# How often to send audio level updates to the display, in milliseconds
+AudioUpdateIntervalMs=50
+
 # Important: After editing this file, restart the service for changes to take effect
 ";
             File.WriteAllText(configPath, defaultConfig);
@@ -144,41 +184,40 @@ MinIntervalSeconds=3
 
         private bool InitializeSerialPort()
         {
+            _serialSemaphore.Wait();
             try
             {
-                lock (_serialLock)
+                if (_serialPort != null)
                 {
-                    // Dispose existing port if any
-                    if (_serialPort != null)
-                    {
-                        if (_serialPort.IsOpen)
-                            _serialPort.Close();
-                        _serialPort.Dispose();
-                    }
-
-                    _serialPort = new SerialPort(_comPort, _baudRate, Parity.None, 8, StopBits.One);
-                    _serialPort.ReadTimeout = 1000;
-                    _serialPort.WriteTimeout = 1000;
-                    _serialPort.Open();
-
-                    // Clear buffers
-                    _serialPort.DiscardInBuffer();
-                    _serialPort.DiscardOutBuffer();
-
-                    _logger.LogInformation($"Serial port {_comPort} opened successfully");
-                    return true;
+                    if (_serialPort.IsOpen)
+                        _serialPort.Close();
+                    _serialPort.Dispose();
                 }
+
+                _serialPort = new SerialPort(_comPort, _baudRate, Parity.None, 8, StopBits.One);
+                _serialPort.ReadTimeout = 1000;
+                _serialPort.WriteTimeout = 1000;
+                _serialPort.Open();
+
+                _serialPort.DiscardInBuffer();
+                _serialPort.DiscardOutBuffer();
+
+                _logger.LogInformation($"Serial port {_comPort} opened successfully");
+                return true;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Failed to open serial port {_comPort}");
                 return false;
             }
+            finally
+            {
+                _serialSemaphore.Release();
+            }
         }
 
         private async Task MonitorAndReconnectAsync(CancellationToken stoppingToken)
         {
-            // Initial connection attempt
             bool initialConnected = false;
             while (!stoppingToken.IsCancellationRequested && !initialConnected)
             {
@@ -195,16 +234,11 @@ MinIntervalSeconds=3
                 await Task.Delay(TimeSpan.FromSeconds(delay), stoppingToken);
             }
 
-            // Continuously monitor connection
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    bool isConnected = false;
-                    lock (_serialLock)
-                    {
-                        isConnected = _serialPort != null && _serialPort.IsOpen;
-                    }
+                    bool isConnected = await IsConnectedAsync();
 
                     if (!isConnected && !_isReconnecting)
                     {
@@ -213,11 +247,9 @@ MinIntervalSeconds=3
                     }
                     else if (isConnected)
                     {
-                        // Check connection health
-                        await CheckConnectionHealthAsync(stoppingToken);
+                        await CheckConnectionHealthAsync();
                     }
 
-                    // Check every 2 seconds for connection issues
                     await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
                 }
                 catch (OperationCanceledException)
@@ -232,48 +264,70 @@ MinIntervalSeconds=3
             }
         }
 
-        private async Task CheckConnectionHealthAsync(CancellationToken stoppingToken)
+        private async Task<bool> IsConnectedAsync()
+        {
+            await _serialSemaphore.WaitAsync();
+            try
+            {
+                return _serialPort != null && _serialPort.IsOpen;
+            }
+            finally
+            {
+                _serialSemaphore.Release();
+            }
+        }
+
+        private async Task CheckConnectionHealthAsync()
         {
             try
             {
                 bool isHealthy = false;
-                lock (_serialLock)
+                await _serialSemaphore.WaitAsync();
+                try
                 {
                     if (_serialPort != null && _serialPort.IsOpen)
                     {
                         try
                         {
-                            // Try a simple write to check if the port is responsive
                             _serialPort.Write("P"); // Ping command
                             isHealthy = true;
                         }
                         catch (Exception)
                         {
-                            // Connection is unhealthy
                             isHealthy = false;
                         }
                     }
+                }
+                finally
+                {
+                    _serialSemaphore.Release();
                 }
 
                 if (!isHealthy)
                 {
                     _logger.LogWarning("Serial port health check failed. Closing and will reconnect.");
-                    lock (_serialLock)
-                    {
-                        if (_serialPort != null && _serialPort.IsOpen)
-                        {
-                            try
-                            {
-                                _serialPort.Close();
-                            }
-                            catch { }
-                        }
-                    }
+                    await CloseSerialPortAsync();
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Health check error");
+            }
+        }
+
+        private async Task CloseSerialPortAsync()
+        {
+            await _serialSemaphore.WaitAsync();
+            try
+            {
+                if (_serialPort != null && _serialPort.IsOpen)
+                {
+                    try { _serialPort.Close(); } catch { }
+                }
+            }
+            finally
+            {
+                _serialSemaphore.Release();
             }
         }
 
@@ -286,7 +340,6 @@ MinIntervalSeconds=3
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    // Generate random delay between 5-10 seconds
                     int delay = _random.Next(MIN_RECONNECT_DELAY_SECONDS, MAX_RECONNECT_DELAY_SECONDS + 1);
                     _logger.LogInformation($"Waiting {delay} seconds before reconnect attempt...");
                     await Task.Delay(TimeSpan.FromSeconds(delay), stoppingToken);
@@ -296,8 +349,8 @@ MinIntervalSeconds=3
 
                     _logger.LogInformation("Attempting to reconnect...");
 
-                    // Close and dispose existing port
-                    lock (_serialLock)
+                    await _serialSemaphore.WaitAsync(stoppingToken);
+                    try
                     {
                         if (_serialPort != null)
                         {
@@ -307,8 +360,11 @@ MinIntervalSeconds=3
                             _serialPort = null;
                         }
                     }
+                    finally
+                    {
+                        _serialSemaphore.Release();
+                    }
 
-                    // Try to reconnect
                     if (InitializeSerialPort())
                     {
                         _logger.LogInformation("Reconnection successful!");
@@ -340,16 +396,10 @@ MinIntervalSeconds=3
             {
                 try
                 {
-                    // Check if serial port is connected before attempting to send
-                    bool isConnected = false;
-                    lock (_serialLock)
-                    {
-                        isConnected = _serialPort != null && _serialPort.IsOpen;
-                    }
+                    bool isConnected = await IsConnectedAsync();
 
                     if (!isConnected)
                     {
-                        // Wait and try again later
                         await Task.Delay(1000, stoppingToken);
                         continue;
                     }
@@ -360,7 +410,6 @@ MinIntervalSeconds=3
                         string currentKey = $"{songData.Title}|{songData.Artist}";
                         bool currentIsPlaying = songData.IsPlaying;
 
-                        // Calculate cooldown
                         bool hasBeenCooldownTime = (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3);
 
                         if ((_lastSongKey != currentKey && hasBeenCooldownTime) ||
@@ -379,18 +428,7 @@ MinIntervalSeconds=3
                             else
                             {
                                 _logger.LogWarning("Failed to send data to Arduino - connection may be lost");
-                                // Mark connection as failed so reconnection triggers
-                                lock (_serialLock)
-                                {
-                                    if (_serialPort != null && _serialPort.IsOpen)
-                                    {
-                                        try
-                                        {
-                                            _serialPort.Close();
-                                        }
-                                        catch { }
-                                    }
-                                }
+                                await CloseSerialPortAsync();
                             }
                         }
                     }
@@ -408,6 +446,63 @@ MinIntervalSeconds=3
             }
         }
 
+        // Sends the compact real-time audio packet: 'A' + volL + volR + 7 left
+        // bands + 7 right bands (17 bytes total). Runs on its own fast loop,
+        // independent from the song-metadata/thumbnail packet.
+        private async Task SendAudioDataAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    if (_audioAnalyzer != null && await IsConnectedAsync())
+                    {
+                        await SendAudioPacketAsync();
+                    }
+
+                    await Task.Delay(_audioUpdateIntervalMs, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Audio send loop error");
+                    await Task.Delay(1000, stoppingToken);
+                }
+            }
+        }
+
+        private async Task SendAudioPacketAsync()
+        {
+            if (_audioAnalyzer == null) return;
+
+            byte[] packet = new byte[1 + 2 + 7 + 7];
+            packet[0] = (byte)'A';
+            packet[1] = _audioAnalyzer.VolumeLeft;
+            packet[2] = _audioAnalyzer.VolumeRight;
+            Array.Copy(_audioAnalyzer.LeftBands, 0, packet, 3, 7);
+            Array.Copy(_audioAnalyzer.RightBands, 0, packet, 10, 7);
+
+            await _serialSemaphore.WaitAsync();
+            try
+            {
+                if (_serialPort != null && _serialPort.IsOpen)
+                {
+                    _serialPort.Write(packet, 0, packet.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send audio packet");
+            }
+            finally
+            {
+                _serialSemaphore.Release();
+            }
+        }
+
         private async Task ReadArduinoOutputAsync(CancellationToken stoppingToken)
         {
             try
@@ -415,48 +510,36 @@ MinIntervalSeconds=3
                 while (!stoppingToken.IsCancellationRequested)
                 {
                     bool canRead = false;
-                    lock (_serialLock)
+                    await _serialSemaphore.WaitAsync(stoppingToken);
+                    try
                     {
                         canRead = _serialPort != null && _serialPort.IsOpen && _serialPort.BytesToRead > 0;
+                        if (canRead && _serialPort != null)
+                        {
+                            try
+                            {
+                                string line = _serialPort.ReadLine();
+                                if (!string.IsNullOrWhiteSpace(line))
+                                {
+                                    _logger.LogInformation($"[ARDUINO] {line}");
+                                }
+                            }
+                            catch (TimeoutException)
+                            {
+                                // Normal timeout, just continue
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Error reading from Arduino - connection may be lost");
+                                try { _serialPort.Close(); } catch { }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        _serialSemaphore.Release();
                     }
 
-                    if (canRead)
-                    {
-                        try
-                        {
-                            lock (_serialLock)
-                            {
-                                if (_serialPort != null && _serialPort.IsOpen)
-                                {
-                                    string line = _serialPort.ReadLine();
-                                    if (!string.IsNullOrWhiteSpace(line))
-                                    {
-                                        _logger.LogInformation($"[ARDUINO] {line}");
-                                    }
-                                }
-                            }
-                        }
-                        catch (TimeoutException)
-                        {
-                            // Normal timeout, just continue
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Error reading from Arduino - connection may be lost");
-                            // Mark for reconnection
-                            lock (_serialLock)
-                            {
-                                if (_serialPort != null && _serialPort.IsOpen)
-                                {
-                                    try
-                                    {
-                                        _serialPort.Close();
-                                    }
-                                    catch { }
-                                }
-                            }
-                        }
-                    }
                     await Task.Delay(10, stoppingToken);
                 }
             }
@@ -488,42 +571,34 @@ MinIntervalSeconds=3
             return false;
         }
 
+        // Holds the semaphore for the WHOLE packet (marker + metadata +
+        // thumbnail), including the delays between chunks. This guarantees
+        // the fast audio-send loop can't write an 'A' packet in the middle
+        // of a song packet and desync the Arduino's parser.
         private async Task<bool> SendCompleteDataPacketAsync(SongData data)
         {
+            await _serialSemaphore.WaitAsync();
             try
             {
-                lock (_serialLock)
-                {
-                    if (_serialPort == null || !_serialPort.IsOpen)
-                        return false;
+                if (_serialPort == null || !_serialPort.IsOpen)
+                    return false;
 
-                    _serialPort.DiscardInBuffer();
-                    _serialPort.DiscardOutBuffer();
-                    _serialPort.Write("S");
-                    Thread.Sleep(50);
-                }
+                _serialPort.DiscardInBuffer();
+                _serialPort.DiscardOutBuffer();
+                _serialPort.Write("S");
+                await Task.Delay(50);
 
                 string metadata = $"{data.Title}|{data.Artist}|{data.Duration}|{data.Position}|{data.Source}|{data.IsPlaying}\n";
                 byte[] metadataBytes = System.Text.Encoding.UTF8.GetBytes(metadata);
                 byte[] thumbnail = data.Thumbnail ?? CreateTestThumbnail();
 
-                lock (_serialLock)
-                {
-                    if (_serialPort == null || !_serialPort.IsOpen)
-                        return false;
-
-                    _serialPort.Write(metadataBytes, 0, metadataBytes.Length);
-                }
+                if (!_serialPort.IsOpen) return false;
+                _serialPort.Write(metadataBytes, 0, metadataBytes.Length);
 
                 await Task.Delay(50);
 
-                lock (_serialLock)
-                {
-                    if (_serialPort == null || !_serialPort.IsOpen)
-                        return false;
-
-                    _serialPort.Write(thumbnail, 0, thumbnail.Length);
-                }
+                if (!_serialPort.IsOpen) return false;
+                _serialPort.Write(thumbnail, 0, thumbnail.Length);
 
                 await Task.Delay(500);
                 return true;
@@ -533,9 +608,13 @@ MinIntervalSeconds=3
                 _logger.LogWarning(ex, "Send error");
                 return false;
             }
+            finally
+            {
+                _serialSemaphore.Release();
+            }
         }
 
-        private async Task<SongData> GetCurrentSongDataAsync()
+        private async Task<SongData?> GetCurrentSongDataAsync()
         {
             try
             {
@@ -561,7 +640,7 @@ MinIntervalSeconds=3
                 string title = mediaProperties.Title.Replace("|", "").Trim();
                 string artist = (mediaProperties.Artist ?? "Unknown Artist").Replace("|", "").Trim();
 
-                byte[] thumbnailBytes = null;
+                byte[]? thumbnailBytes = null;
                 if (mediaProperties.Thumbnail != null)
                 {
                     thumbnailBytes = await GetAndConvertThumbnailAsync(mediaProperties.Thumbnail);
@@ -585,7 +664,11 @@ MinIntervalSeconds=3
             }
         }
 
-        private async Task<byte[]> GetAndConvertThumbnailAsync(Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
+        // Rewritten to use LockBits + Marshal.Copy instead of GetPixel, which
+        // was doing 6400 individual (slow) calls per thumbnail. This matters
+        // more now that the process also has a live audio pipeline competing
+        // for CPU time.
+        private async Task<byte[]?> GetAndConvertThumbnailAsync(Windows.Storage.Streams.IRandomAccessStreamReference thumbnailRef)
         {
             try
             {
@@ -598,31 +681,50 @@ MinIntervalSeconds=3
                         dataReader.ReadBytes(rawBytes);
                     }
 
-                    using (var ms = new MemoryStream(rawBytes))
-                    using (var originalImage = System.Drawing.Image.FromStream(ms))
-                    using (var resizedBitmap = new System.Drawing.Bitmap(80, 80))
+                    using var ms = new MemoryStream(rawBytes);
+                    using var originalImage = System.Drawing.Image.FromStream(ms);
+                    using var resizedBitmap = new System.Drawing.Bitmap(80, 80, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
                     using (var graphics = System.Drawing.Graphics.FromImage(resizedBitmap))
                     {
                         graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                         graphics.DrawImage(originalImage, 0, 0, 80, 80);
+                    }
+
+                    var rect = new System.Drawing.Rectangle(0, 0, 80, 80);
+                    var bmpData = resizedBitmap.LockBits(rect, System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+
+                    try
+                    {
+                        int stride = bmpData.Stride;
+                        byte[] pixelData = new byte[stride * 80];
+                        Marshal.Copy(bmpData.Scan0, pixelData, 0, pixelData.Length);
 
                         byte[] rgb565 = new byte[80 * 80 * 2];
-
                         for (int y = 0; y < 80; y++)
                         {
+                            int rowStart = y * stride;
                             for (int x = 0; x < 80; x++)
                             {
-                                System.Drawing.Color pixel = resizedBitmap.GetPixel(x, y);
-                                int r = (pixel.R >> 3) & 0x1F;
-                                int g = (pixel.G >> 2) & 0x3F;
-                                int b = (pixel.B >> 3) & 0x1F;
-                                ushort rgb565Color = (ushort)((r << 11) | (g << 5) | b);
-                                int index = (y * 80 + x) * 2;
-                                rgb565[index] = (byte)(rgb565Color & 0xFF);
-                                rgb565[index + 1] = (byte)((rgb565Color >> 8) & 0xFF);
+                                int px = rowStart + x * 3;
+                                byte b = pixelData[px];
+                                byte g = pixelData[px + 1];
+                                byte r = pixelData[px + 2];
+
+                                int r5 = (r >> 3) & 0x1F;
+                                int g6 = (g >> 2) & 0x3F;
+                                int b5 = (b >> 3) & 0x1F;
+                                ushort color = (ushort)((r5 << 11) | (g6 << 5) | b5);
+
+                                int idx = (y * 80 + x) * 2;
+                                rgb565[idx] = (byte)(color & 0xFF);
+                                rgb565[idx + 1] = (byte)((color >> 8) & 0xFF);
                             }
                         }
                         return rgb565;
+                    }
+                    finally
+                    {
+                        resizedBitmap.UnlockBits(bmpData);
                     }
                 }
             }
@@ -655,12 +757,12 @@ MinIntervalSeconds=3
 
     public class SongData
     {
-        public string Title { get; set; }
-        public string Artist { get; set; }
+        public string Title { get; set; } = "";
+        public string Artist { get; set; } = "";
         public int Duration { get; set; }
         public int Position { get; set; }
-        public string Source { get; set; }
+        public string Source { get; set; } = "";
         public bool IsPlaying { get; set; }
-        public byte[] Thumbnail { get; set; }
+        public byte[]? Thumbnail { get; set; }
     }
 }
