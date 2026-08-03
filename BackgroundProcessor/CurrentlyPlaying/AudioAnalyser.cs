@@ -137,8 +137,8 @@ namespace MusicToArduino
             byte volL = RmsToByte(CalculateRms(_leftBuffer));
             byte volR = RmsToByte(CalculateRms(_rightBuffer));
 
-            byte[] leftBands = ComputeBands(_leftBuffer, sampleRate);
-            byte[] rightBands = ComputeBands(_rightBuffer, sampleRate);
+            byte[] leftBands = ComputeBands(_leftBuffer, sampleRate, _leftBandPeak);
+            byte[] rightBands = ComputeBands(_rightBuffer, sampleRate, _rightBandPeak);
 
             lock (_resultLock)
             {
@@ -149,9 +149,32 @@ namespace MusicToArduino
             }
         }
 
-        private readonly NAudio.Dsp.Complex[] _fftBuffer = new NAudio.Dsp.Complex[FftLength];
+        private readonly Complex[] _fftBuffer = new Complex[FftLength];
 
-        private byte[] ComputeBands(float[] samples, int sampleRate)
+        // Per-band, per-channel "recent peak" trackers used for auto-gain
+        // (see ComputeBands). Without this, a single fixed dB range applied
+        // to every band means bass/low-mid content (which naturally carries
+        // far more energy in most music) reads loud while the upper bands
+        // rarely cross the threshold at all - which is why only a couple of
+        // bars were moving. Normalizing each band against its own recent
+        // peak instead means every band uses its own dynamic range.
+        private readonly double[] _leftBandPeak = InitPeaks();
+        private readonly double[] _rightBandPeak = InitPeaks();
+        private static double[] InitPeaks()
+        {
+            var p = new double[7];
+            Array.Fill(p, PeakFloor);
+            return p;
+        }
+
+        // How quickly a band's peak "forgets" a loud moment. Applied once
+        // per FFT frame (~46ms at 44.1kHz/2048 samples), so 0.985 decays
+        // to half over roughly 2 seconds - responsive, but not so twitchy
+        // that a single transient throws off normalization.
+        private const double PeakDecay = 0.985;
+        private const double PeakFloor = 1e-5;
+
+        private byte[] ComputeBands(float[] samples, int sampleRate, double[] bandPeaks)
         {
             for (int i = 0; i < FftLength; i++)
             {
@@ -186,22 +209,24 @@ namespace MusicToArduino
             for (int b = 0; b < 7; b++)
             {
                 double avgMagnitude = bandCounts[b] > 0 ? bandTotals[b] / bandCounts[b] : 0;
-                result[b] = MagnitudeToByte(avgMagnitude);
+
+                // Auto-gain per band: jump up instantly on a new peak,
+                // decay slowly otherwise, then express the current value
+                // as a fraction of that peak.
+                if (avgMagnitude > bandPeaks[b])
+                {
+                    bandPeaks[b] = avgMagnitude;
+                }
+                else
+                {
+                    bandPeaks[b] = Math.Max(bandPeaks[b] * PeakDecay, PeakFloor);
+                }
+
+                double normalized = bandPeaks[b] > PeakFloor ? avgMagnitude / bandPeaks[b] : 0;
+                normalized = Math.Clamp(normalized, 0, 1);
+                result[b] = (byte)(normalized * 100);
             }
             return result;
-        }
-
-        // Rough dB-scaled mapping to 0-100. Tune MinDb if your bars feel
-        // too dim/too pinned at max for your source material.
-        private const double MinDb = -60;
-        private const double MaxDb = 0;
-
-        private static byte MagnitudeToByte(double magnitude)
-        {
-            double db = 20 * Math.Log10(magnitude + 1e-6);
-            double normalized = (db - MinDb) / (MaxDb - MinDb);
-            normalized = Math.Clamp(normalized, 0, 1);
-            return (byte)(normalized * 100);
         }
 
         private const double MinVolumeDb = -50;

@@ -69,11 +69,13 @@ enum State {
   WAITING_FOR_START,
   READING_METADATA,
   READING_THUMBNAIL,
-  READING_AUDIO
+  READING_AUDIO,
+  READING_TIMING
 };
 
 State currentState = WAITING_FOR_START;
 String metadataBuffer = "";
+String timingBuffer = "";
 int thumbnailBytesRead = 0;
 
 // Timeout settings
@@ -445,6 +447,7 @@ void handlePlayStateChange(bool newPlayingState) {
 void resetToWaitingState() {
   currentState = WAITING_FOR_START;
   metadataBuffer = "";
+  timingBuffer = "";
   thumbnailBytesRead = 0;
   audioBytesRead = 0;
   hasThumbnail = false;
@@ -479,6 +482,9 @@ void processIncomingData() {
         } else if (c == 'A') {
           currentState = READING_AUDIO;
           audioBytesRead = 0;
+        } else if (c == 'T') {
+          currentState = READING_TIMING;
+          timingBuffer = "";
         }
         break;
         
@@ -550,7 +556,55 @@ void processIncomingData() {
           currentState = WAITING_FOR_START;
         }
         break;
+
+      case READING_TIMING:
+        if (c == '\n') {
+          parseTiming(timingBuffer);
+          currentState = WAITING_FOR_START;
+        } else {
+          timingBuffer += c;
+        }
+        break;
     }
+  }
+}
+
+// Lightweight update: position/duration/play-state only, no thumbnail or
+// title/artist. Sent much more often than the full packet so the on-screen
+// clock stays accurate without re-transmitting the thumbnail every time.
+void parseTiming(String data) {
+  if (!hasValidSong) return;
+
+  int firstPipe = data.indexOf('|');
+  int secondPipe = data.indexOf('|', firstPipe + 1);
+
+  if (firstPipe <= 0 || secondPipe <= 0) {
+    Serial.println("Failed to parse timing update!");
+    return;
+  }
+
+  int newDuration = data.substring(0, firstPipe).toInt();
+  int newPosition = data.substring(firstPipe + 1, secondPipe).toInt();
+  bool newPlayingState = (data.substring(secondPipe + 1) == "True" || data.substring(secondPipe + 1) == "true");
+
+  currentDuration = newDuration;
+  currentPosition = newPosition;
+  initialPosition = newPosition;
+  songStartTime = millis();
+  lastPauseTime = 0;
+
+  if (currentPosition < currentDuration) {
+    songEnded = false;
+  }
+
+  bool stateChanged = (newPlayingState != isPlaying);
+  if (stateChanged) {
+    handlePlayStateChange(newPlayingState);
+  }
+
+  updateProgressAndTime();
+  if (!stateChanged) {
+    updatePlayPauseState();
   }
 }
 

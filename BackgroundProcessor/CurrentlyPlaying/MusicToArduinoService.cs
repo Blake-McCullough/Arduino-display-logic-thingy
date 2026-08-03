@@ -13,8 +13,19 @@ namespace MusicToArduino
         private SerialPort? _serialPort;
         private bool _lastIsPlaying = false;
         private string _lastSongKey = "";
-        private DateTime _lastSendTime = DateTime.MinValue;
-        private TimeSpan _minSendInterval = TimeSpan.FromSeconds(3);
+
+        // Full packets (title/artist/thumbnail) are slow - the 80x80
+        // thumbnail alone is 12,800 bytes, which takes over a second to
+        // transmit at 115200 baud plus render on the Arduino. Sending that
+        // on every tick is what was making position tracking feel laggy
+        // AND starving the audio-bar packets of serial time. So position/
+        // duration/play-state now go out on their own small, frequent
+        // "timing" packet, and the full packet is only sent when the song
+        // actually changes (plus an occasional resync as a safety net).
+        private DateTime _lastFullSendTime = DateTime.MinValue;
+        private DateTime _lastTimingSendTime = DateTime.MinValue;
+        private TimeSpan _timingUpdateInterval = TimeSpan.FromSeconds(1);
+        private TimeSpan _fullResyncInterval = TimeSpan.FromSeconds(60);
 
         // Guards every access to _serialPort. A SemaphoreSlim (rather than a
         // plain lock/object) is used because we need to hold it across
@@ -123,8 +134,13 @@ namespace MusicToArduino
                             case "baudrate":
                                 if (int.TryParse(value, out int baud)) _baudRate = baud;
                                 break;
-                            case "minintervalseconds":
-                                if (int.TryParse(value, out int interval)) _minSendInterval = TimeSpan.FromSeconds(interval);
+                            case "timingupdateintervalseconds":
+                                if (double.TryParse(value, out double timingInterval) && timingInterval > 0)
+                                    _timingUpdateInterval = TimeSpan.FromSeconds(timingInterval);
+                                break;
+                            case "fullresyncintervalseconds":
+                                if (int.TryParse(value, out int resyncInterval))
+                                    _fullResyncInterval = resyncInterval > 0 ? TimeSpan.FromSeconds(resyncInterval) : TimeSpan.MaxValue;
                                 break;
                             case "enableaudiovisualization":
                                 if (bool.TryParse(value, out bool enableAudio)) _enableAudioVisualization = enableAudio;
@@ -145,8 +161,8 @@ namespace MusicToArduino
                 if (_baudRate <= 0) _baudRate = 115200;
 
                 _logger.LogInformation(
-                    "Configuration loaded: COM={ComPort}, Baud={Baud}, Interval={Interval}s, Audio={Audio}, AudioIntervalMs={AudioMs}",
-                    _comPort, _baudRate, _minSendInterval.TotalSeconds, _enableAudioVisualization, _audioUpdateIntervalMs);
+                    "Configuration loaded: COM={ComPort}, Baud={Baud}, TimingInterval={Timing}s, FullResync={Resync}s, Audio={Audio}, AudioIntervalMs={AudioMs}",
+                    _comPort, _baudRate, _timingUpdateInterval.TotalSeconds, _fullResyncInterval.TotalSeconds, _enableAudioVisualization, _audioUpdateIntervalMs);
                 return true;
             }
             catch (Exception ex)
@@ -168,8 +184,16 @@ COMPort=COM3
 # Baud rate (default: 115200)
 BaudRate=115200
 
-# Minimum interval between sending song updates (seconds)
-MinIntervalSeconds=3
+# How often to send lightweight position/duration/play-state updates
+# (seconds, decimals allowed e.g. 0.5). This is cheap - it does NOT
+# resend the thumbnail - so it's safe to set this low for accurate timing.
+TimingUpdateIntervalSeconds=1
+
+# How often to resend the FULL packet (title/artist/thumbnail) as a
+# safety-net resync even if the song hasn't changed, in case a display
+# reboot or dropped connection caused it to miss the real change event.
+# This is the slow, ~1 second transfer, so keep it infrequent.
+FullResyncIntervalSeconds=60
 
 # Enable/disable real-time audio (volume + frequency band) visualization
 EnableAudioVisualization=true
@@ -409,21 +433,20 @@ AudioUpdateIntervalMs=50
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
                         bool currentIsPlaying = songData.IsPlaying;
+                        bool isNewSong = _lastSongKey != currentKey;
+                        bool dueForFullResync = (DateTime.Now - _lastFullSendTime) >= _fullResyncInterval;
 
-                        bool hasBeenCooldownTime = (DateTime.Now - _lastSendTime) >= TimeSpan.FromSeconds(3);
-
-                        if ((_lastSongKey != currentKey && hasBeenCooldownTime) ||
-                            (_lastIsPlaying != currentIsPlaying && hasBeenCooldownTime) ||
-                            ((DateTime.Now - _lastSendTime) >= _minSendInterval))
+                        if (isNewSong || dueForFullResync)
                         {
-                            _lastIsPlaying = currentIsPlaying;
                             _lastSongKey = currentKey;
-                            _lastSendTime = DateTime.Now;
+                            _lastIsPlaying = currentIsPlaying;
+                            _lastFullSendTime = DateTime.Now;
+                            _lastTimingSendTime = DateTime.Now;
 
                             bool success = await SendToArduinoWithRetryAsync(songData);
                             if (success)
                             {
-                                _logger.LogInformation($"Sent: {songData.Title} - {songData.Artist}");
+                                _logger.LogInformation($"Sent (full): {songData.Title} - {songData.Artist}");
                             }
                             else
                             {
@@ -431,8 +454,30 @@ AudioUpdateIntervalMs=50
                                 await CloseSerialPortAsync();
                             }
                         }
+                        else
+                        {
+                            bool playStateChanged = _lastIsPlaying != currentIsPlaying;
+                            bool dueForTimingUpdate = (DateTime.Now - _lastTimingSendTime) >= _timingUpdateInterval;
+
+                            if (playStateChanged || dueForTimingUpdate)
+                            {
+                                _lastIsPlaying = currentIsPlaying;
+                                _lastTimingSendTime = DateTime.Now;
+
+                                bool success = await SendTimingUpdateAsync(songData);
+                                if (!success)
+                                {
+                                    _logger.LogWarning("Failed to send timing update - connection may be lost");
+                                    await CloseSerialPortAsync();
+                                }
+                            }
+                        }
                     }
-                    await Task.Delay(1000, stoppingToken);
+
+                    // Poll faster than the timing interval itself so the
+                    // actual send doesn't drift by up to a full interval
+                    // due to loop granularity.
+                    await Task.Delay(250, stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -569,6 +614,36 @@ AudioUpdateIntervalMs=50
                 }
             }
             return false;
+        }
+
+        // Lightweight packet for position/duration/play-state only - no
+        // thumbnail, no title/artist. A few bytes, transmits in under a
+        // millisecond at 115200 baud, so it's safe to send this often
+        // without starving the audio-bar packets of serial time.
+        private async Task<bool> SendTimingUpdateAsync(SongData data)
+        {
+            await _serialSemaphore.WaitAsync();
+            try
+            {
+                if (_serialPort == null || !_serialPort.IsOpen)
+                    return false;
+
+                string payload = $"{data.Duration}|{data.Position}|{data.IsPlaying}\n";
+                byte[] bytes = System.Text.Encoding.UTF8.GetBytes(payload);
+
+                _serialPort.Write("T");
+                _serialPort.Write(bytes, 0, bytes.Length);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Timing update send error");
+                return false;
+            }
+            finally
+            {
+                _serialSemaphore.Release();
+            }
         }
 
         // Holds the semaphore for the WHOLE packet (marker + metadata +
