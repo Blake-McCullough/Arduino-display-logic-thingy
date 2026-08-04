@@ -707,6 +707,36 @@ AudioUpdateIntervalMs=50
                 bool isPlaying = playbackProperties.PlaybackStatus ==
                     GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
 
+                // timelineProperties.Position is a SNAPSHOT taken at
+                // LastUpdatedTime, not a live clock - GSMTC only refreshes
+                // it on play/pause/seek/track-change events. If we send
+                // that raw value on our 1-second timing tick, it reads as
+                // "frozen" until the next real event (which is why the
+                // display only moved on pause/resume). To make it advance
+                // smoothly, interpolate forward using wall-clock time
+                // elapsed since the last snapshot, scaled by playback rate,
+                // whenever the track is actually playing.
+                TimeSpan reportedPosition = timelineProperties.Position;
+                TimeSpan effectivePosition = reportedPosition;
+
+                if (isPlaying)
+                {
+                    double rate = playbackProperties.PlaybackRate ?? 1.0;
+                    TimeSpan elapsedSinceUpdate = DateTimeOffset.Now - timelineProperties.LastUpdatedTime;
+                    if (elapsedSinceUpdate > TimeSpan.Zero)
+                    {
+                        effectivePosition = reportedPosition + TimeSpan.FromTicks((long)(elapsedSinceUpdate.Ticks * rate));
+                    }
+                }
+
+                // Clamp: a stale or late-arriving snapshot near the end of
+                // a track (or a system clock hiccup) shouldn't push the
+                // interpolated value past EndTime or below zero.
+                if (effectivePosition < TimeSpan.Zero)
+                    effectivePosition = TimeSpan.Zero;
+                if (timelineProperties.EndTime > TimeSpan.Zero && effectivePosition > timelineProperties.EndTime)
+                    effectivePosition = timelineProperties.EndTime;
+
                 string sourceApp = currentSession.SourceAppUserModelId ?? "Unknown Source";
                 if (sourceApp.Contains("!"))
                     sourceApp = sourceApp.Substring(sourceApp.LastIndexOf('!') + 1);
@@ -726,7 +756,7 @@ AudioUpdateIntervalMs=50
                     Title = title,
                     Artist = artist,
                     Duration = (int)timelineProperties.EndTime.TotalSeconds,
-                    Position = (int)timelineProperties.Position.TotalSeconds,
+                    Position = (int)effectivePosition.TotalSeconds,
                     Source = sourceApp,
                     IsPlaying = isPlaying,
                     Thumbnail = thumbnailBytes ?? CreateTestThumbnail()

@@ -34,6 +34,14 @@ unsigned long lastPositionUpdate = 0;
 unsigned long songStartTime = 0;
 unsigned long lastPauseTime = 0;
 
+// How many seconds a PC-reported position is allowed to disagree with our
+// own locally-extrapolated position before we treat it as a real seek/drift
+// and re-baseline the clock. Without this tolerance, a timing packet that
+// keeps reporting the same (stale) position every update would pin
+// songStartTime back to "now" each time, and the on-screen clock would
+// never appear to advance even though our own math is fine.
+#define RESYNC_TOLERANCE_SECONDS 2
+
 #define THUMBNAIL_SIZE 12800
 uint8_t thumbnailBuffer[THUMBNAIL_SIZE];
 bool hasThumbnail = false;
@@ -115,17 +123,17 @@ const int BARS_BASELINE_Y = THUMB_Y + FREQ_BAR_MAX_HEIGHT;
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32 Starting...");
-  
+
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
-  
+
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   tft.invertDisplay(true);
-  
+
   showWaitingScreen();
-  
+
   pinMode(4, OUTPUT);
   for (int i = 0; i < 3; i++) {
     digitalWrite(4, HIGH);
@@ -133,7 +141,7 @@ void setup() {
     digitalWrite(4, LOW);
     delay(100);
   }
-  
+
   Serial.println("Ready to receive data");
   lastDataReceived = millis();
 }
@@ -146,7 +154,7 @@ void showWaitingScreen() {
   tft.println("Waiting for");
   tft.setCursor(10, 150);
   tft.println("music...");
-  
+
   hasValidSong = false;
   currentSongKey = "";
   lastSongKey = "";
@@ -167,9 +175,9 @@ void resetAudioState() {
 void renderFullScreen() {
   Serial.println("Rendering full screen for new song");
   tft.fillScreen(TFT_BLACK);
-  
+
   tft.drawRect(THUMB_X - 1, THUMB_Y - 1, 82, 82, TFT_RED);
-  
+
   if (hasThumbnail) {
     for (int y = 0; y < 80; y++) {
       for (int x = 0; x < 80; x++) {
@@ -190,13 +198,13 @@ void renderFullScreen() {
     tft.setCursor(THUMB_X + 15, THUMB_Y + 50);
     tft.println("ART");
   }
-  
+
   initScrollingText();
   drawScrollingTitle();
   drawScrollingArtist();
-  
+
   tft.fillRect(BAR_X, BAR_Y, BAR_WIDTH, BAR_HEIGHT, TFT_DARKGREY);
-  
+
   if (currentSource.length() > 0) {
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
     tft.setTextSize(1);
@@ -205,7 +213,7 @@ void renderFullScreen() {
     tft.setCursor(sourceX, TIME_Y);
     tft.println(currentSource);
   }
-  
+
   updateProgressAndTime();
   updatePlayPauseState();
 
@@ -213,7 +221,7 @@ void renderFullScreen() {
   memset(lastLeftBands, 0, sizeof(lastLeftBands));
   memset(lastRightBands, 0, sizeof(lastRightBands));
   updateFrequencyDisplay();
-  
+
   hasValidSong = true;
   songEnded = false;
 }
@@ -223,12 +231,12 @@ void initScrollingText() {
   if (scrollingTitle.length() > MAX_TITLE_CHARS) {
     scrollingTitle = currentTitle + "   " + currentTitle + "   ";
   }
-  
+
   scrollingArtist = currentArtist;
   if (scrollingArtist.length() > MAX_ARTIST_CHARS) {
     scrollingArtist = currentArtist + "   " + currentArtist + "   ";
   }
-  
+
   titleScrollPos = 0;
   artistScrollPos = 0;
   lastScrollUpdate = millis();
@@ -236,10 +244,10 @@ void initScrollingText() {
 
 void drawScrollingTitle() {
   tft.fillRect(TITLE_X, TITLE_Y - 20, SCREEN_WIDTH - 20, 30, TFT_BLACK);
-  
+
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.setTextSize(2);
-  
+
   if (currentTitle.length() <= MAX_TITLE_CHARS) {
     tft.setCursor(TITLE_X, TITLE_Y);
     tft.println(currentTitle);
@@ -252,10 +260,10 @@ void drawScrollingTitle() {
 
 void drawScrollingArtist() {
   tft.fillRect(ARTIST_X, ARTIST_Y - 10, SCREEN_WIDTH - 20, 20, TFT_BLACK);
-  
+
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextSize(1);
-  
+
   if (currentArtist.length() <= MAX_ARTIST_CHARS) {
     tft.setCursor(ARTIST_X, ARTIST_Y);
     tft.println(currentArtist);
@@ -268,27 +276,27 @@ void drawScrollingArtist() {
 
 void updateScrolling() {
   unsigned long currentTime = millis();
-  
+
   if (currentTime - lastScrollUpdate >= SCROLL_DELAY_MS) {
     bool needsUpdate = false;
-    
+
     if (currentTitle.length() > MAX_TITLE_CHARS) {
       titleScrollPos++;
       if (titleScrollPos > (int)(currentTitle.length() + 3)) titleScrollPos = 0;
       needsUpdate = true;
     }
-    
+
     if (currentArtist.length() > MAX_ARTIST_CHARS) {
       artistScrollPos++;
       if (artistScrollPos > (int)(currentArtist.length() + 3)) artistScrollPos = 0;
       needsUpdate = true;
     }
-    
+
     if (needsUpdate) {
       drawScrollingTitle();
       drawScrollingArtist();
     }
-    
+
     lastScrollUpdate = currentTime;
   }
 }
@@ -363,20 +371,20 @@ void loop() {
       resetToWaitingState();
     }
   }
-  
+
   if (Serial.available()) {
     processIncomingData();
     lastDataReceived = millis();
   }
-  
+
   if (hasValidSong) {
     updateScrolling();
   }
-  
+
   if (hasValidSong && currentDuration > 0 && !songEnded) {
     updatePositionFromTime();
   }
-  
+
   delay(10);
 }
 
@@ -389,16 +397,16 @@ void updatePositionFromTime() {
     }
     return;
   }
-  
+
   unsigned long currentMillis = millis();
   unsigned long elapsedMillis = currentMillis - songStartTime;
   int elapsedSeconds = elapsedMillis / 1000;
-  
+
   int calculatedPosition = initialPosition + elapsedSeconds;
-  
+
   if (calculatedPosition >= currentDuration) {
     calculatedPosition = currentDuration;
-    
+
     if (!songEnded) {
       songEnded = true;
       Serial.println("Song reached end - stopping time tracking");
@@ -406,7 +414,7 @@ void updatePositionFromTime() {
       updatePlayPauseState();
     }
   }
-  
+
   if (calculatedPosition != currentPosition && !songEnded) {
     currentPosition = calculatedPosition;
     lastPositionUpdate = currentMillis;
@@ -421,14 +429,14 @@ void updatePositionFromTime() {
 
 void handlePlayStateChange(bool newPlayingState) {
   if (newPlayingState == isPlaying) return;
-  
+
   if (songEnded) {
     Serial.println("Song has ended - ignoring play/pause change");
     return;
   }
-  
+
   isPlaying = newPlayingState;
-  
+
   if (isPlaying) {
     if (lastPauseTime > 0) {
       unsigned long pauseDuration = millis() - lastPauseTime;
@@ -440,7 +448,7 @@ void handlePlayStateChange(bool newPlayingState) {
     lastPauseTime = millis();
     Serial.println("Playback paused");
   }
-  
+
   updatePlayPauseState();
 }
 
@@ -472,7 +480,7 @@ void resetToWaitingState() {
 void processIncomingData() {
   while (Serial.available()) {
     char c = Serial.read();
-    
+
     switch (currentState) {
       case WAITING_FOR_START:
         if (c == 'S') {
@@ -487,7 +495,7 @@ void processIncomingData() {
           timingBuffer = "";
         }
         break;
-        
+
       case READING_METADATA:
         if (c == '\n') {
           parseMetadata(metadataBuffer);
@@ -496,40 +504,40 @@ void processIncomingData() {
           metadataBuffer += c;
         }
         break;
-        
+
       case READING_THUMBNAIL:
         if (thumbnailBytesRead < THUMBNAIL_SIZE) {
           thumbnailBuffer[thumbnailBytesRead++] = c;
-          
+
           if (thumbnailBytesRead == THUMBNAIL_SIZE) {
             hasThumbnail = true;
             currentState = WAITING_FOR_START;
             lastDataReceived = millis();
-            
+
             String newSongKey = currentTitle + "|" + currentArtist;
-            
+
             if (newSongKey != lastSongKey) {
               Serial.println("New song detected - full refresh");
               lastSongKey = newSongKey;
-              
+
               songStartTime = millis();
               initialPosition = currentPosition;
               lastPauseTime = 0;
               songEnded = false;
-              
+
               renderFullScreen();
             } else {
               Serial.println("Same song - updating timing");
-              
+
               if (songEnded) {
                 songEnded = false;
               }
-              
+
               if (isPlaying) {
                 songStartTime = millis();
                 initialPosition = currentPosition;
               }
-              
+
               if (currentTitle != lastTitle || currentArtist != lastArtist) {
                 initScrollingText();
                 drawScrollingTitle();
@@ -537,11 +545,11 @@ void processIncomingData() {
                 lastTitle = currentTitle;
                 lastArtist = currentArtist;
               }
-              
+
               updateProgressAndTime();
               updatePlayPauseState();
             }
-            
+
             digitalWrite(4, HIGH);
             delay(200);
             digitalWrite(4, LOW);
@@ -572,6 +580,19 @@ void processIncomingData() {
 // Lightweight update: position/duration/play-state only, no thumbnail or
 // title/artist. Sent much more often than the full packet so the on-screen
 // clock stays accurate without re-transmitting the thumbnail every time.
+//
+// FIX: previously this unconditionally stomped songStartTime/initialPosition
+// on every single timing packet. If the PC ever sends the same (stale)
+// position repeatedly - which can happen depending on how it sources
+// position data - that reset songStartTime to "now" each time before the
+// local elapsed-time counter ever got past a full second, so the on-screen
+// clock appeared frozen even though the underlying math was correct.
+//
+// Now we only re-baseline the clock when the reported position actually
+// disagrees with what we're already calculating locally (beyond a small
+// tolerance) - i.e. on a real seek, a real state change, or meaningful
+// drift. Otherwise we trust our own local extrapolation and just let it
+// keep counting.
 void parseTiming(String data) {
   if (!hasValidSong) return;
 
@@ -588,9 +609,24 @@ void parseTiming(String data) {
   bool newPlayingState = (data.substring(secondPipe + 1) == "True" || data.substring(secondPipe + 1) == "true");
 
   currentDuration = newDuration;
-  currentPosition = newPosition;
-  initialPosition = newPosition;
-  songStartTime = millis();
+
+  // What we'd currently report if we trusted our own local extrapolation.
+  int predictedPosition = currentPosition;
+  if (isPlaying && currentDuration > 0 && !songEnded) {
+    unsigned long elapsedMillis = millis() - songStartTime;
+    predictedPosition = initialPosition + (int)(elapsedMillis / 1000);
+  }
+
+  bool positionDrifted = abs(newPosition - predictedPosition) > RESYNC_TOLERANCE_SECONDS;
+
+  // Always re-baseline when paused (position can't be "wrong" while
+  // stopped) or when the reported value has genuinely drifted from our
+  // prediction (real seek, or our own clock drifting).
+  if (!isPlaying || positionDrifted) {
+    currentPosition = newPosition;
+    initialPosition = newPosition;
+    songStartTime = millis();
+  }
   lastPauseTime = 0;
 
   if (currentPosition < currentDuration) {
@@ -614,7 +650,7 @@ void parseMetadata(String metadata) {
   int thirdPipe = metadata.indexOf('|', secondPipe + 1);
   int fourthPipe = metadata.indexOf('|', thirdPipe + 1);
   int fifthPipe = metadata.indexOf('|', fourthPipe + 1);
-  
+
   if (firstPipe > 0 && secondPipe > 0 && thirdPipe > 0 && fourthPipe > 0 && fifthPipe > 0) {
     String newTitle = metadata.substring(0, firstPipe);
     String newArtist = metadata.substring(firstPipe + 1, secondPipe);
@@ -622,23 +658,23 @@ void parseMetadata(String metadata) {
     int newPosition = metadata.substring(thirdPipe + 1, fourthPipe).toInt();
     String newSource = metadata.substring(fourthPipe + 1, fifthPipe);
     bool newPlayingState = (metadata.substring(fifthPipe + 1) == "True" || metadata.substring(fifthPipe + 1) == "true");
-    
+
     String newSongKey = newTitle + "|" + newArtist;
     bool isNewSong = (newSongKey != lastSongKey);
-    
+
     currentTitle = newTitle;
     currentArtist = newArtist;
     currentDuration = newDuration;
     currentSource = newSource;
     currentPosition = newPosition;
     initialPosition = newPosition;
-      
+
     currentSource.replace("Microsoft.", "");
     currentSource.replace("AppleInc.", "Apple ");
     if (currentSource.length() > 15) {
       currentSource = currentSource.substring(0, 12) + "...";
     }
-    
+
     if (isNewSong) {
       songEnded = false;
       handlePlayStateChange(newPlayingState);
@@ -654,15 +690,15 @@ void parseMetadata(String metadata) {
 
 void updateProgressAndTime() {
   if (!hasValidSong) return;
-  
+
   if (currentDuration > 0) {
     int progressWidth = (currentPosition * BAR_WIDTH) / currentDuration;
-    
+
     tft.fillRect(BAR_X, BAR_Y, BAR_WIDTH, BAR_HEIGHT, TFT_DARKGREY);
     if (progressWidth > 0) {
       tft.fillRect(BAR_X, BAR_Y, progressWidth, BAR_HEIGHT, TFT_GREEN);
     }
-    
+
     tft.fillRect(TIME_X, TIME_Y - 8, 100, 16, TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextSize(1);
@@ -673,9 +709,9 @@ void updateProgressAndTime() {
 
 void updatePlayPauseState() {
   if (!hasValidSong) return;
-  
+
   tft.fillRect(BAR_X, BAR_Y - 12, BAR_WIDTH, 12, TFT_BLACK);
-  
+
   if (!songEnded && !isPlaying && currentPosition < currentDuration) {
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.setTextSize(1);
