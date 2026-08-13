@@ -36,6 +36,16 @@ namespace MusicToArduino
         private bool _isReconnecting = false;
         private readonly Random _random = new Random();
 
+        // Buffers partial Arduino log output between polls (see
+        // ReadArduinoOutputAsync) so we can read non-blockingly instead of
+        // holding the serial semaphore for up to a second at a time.
+        private string _arduinoLineBuffer = "";
+
+        // Requesting this is a WinRT/COM round trip; it only needs to happen
+        // once, not on every poll. GetCurrentSession() is what needs to run
+        // repeatedly to notice the active app changing.
+        private GlobalSystemMediaTransportControlsSessionManager? _sessionManager;
+
         private AudioAnalyzer? _audioAnalyzer;
 
         // Configuration
@@ -225,6 +235,7 @@ AudioUpdateIntervalMs=50
 
                 _serialPort.DiscardInBuffer();
                 _serialPort.DiscardOutBuffer();
+                _arduinoLineBuffer = "";
 
                 _logger.LogInformation($"Serial port {_comPort} opened successfully");
                 return true;
@@ -428,7 +439,10 @@ AudioUpdateIntervalMs=50
                         continue;
                     }
 
-                    var songData = await GetCurrentSongDataAsync();
+                    // Lightweight fetch: title/artist/position/etc only, no
+                    // thumbnail decode. We need this every poll just to
+                    // detect a song change, so it has to stay cheap.
+                    var songData = await GetCurrentSongDataAsync(includeThumbnail: false);
                     if (songData != null)
                     {
                         string currentKey = $"{songData.Title}|{songData.Artist}";
@@ -438,15 +452,23 @@ AudioUpdateIntervalMs=50
 
                         if (isNewSong || dueForFullResync)
                         {
+                            // Only decode/resize the album art (GDI+ image
+                            // load + resize + RGB565 conversion) right before
+                            // we're actually about to transmit it. This used
+                            // to happen unconditionally on every 250ms poll -
+                            // 4x/second, forever - even though it was only
+                            // ever sent on a song change or once a minute.
+                            var fullSongData = await GetCurrentSongDataAsync(includeThumbnail: true) ?? songData;
+
                             _lastSongKey = currentKey;
                             _lastIsPlaying = currentIsPlaying;
                             _lastFullSendTime = DateTime.Now;
                             _lastTimingSendTime = DateTime.Now;
 
-                            bool success = await SendToArduinoWithRetryAsync(songData);
+                            bool success = await SendToArduinoWithRetryAsync(fullSongData);
                             if (success)
                             {
-                                _logger.LogInformation($"Sent (full): {songData.Title} - {songData.Artist}");
+                                _logger.LogInformation($"Sent (full): {fullSongData.Title} - {fullSongData.Artist}");
                             }
                             else
                             {
@@ -563,15 +585,26 @@ AudioUpdateIntervalMs=50
                         {
                             try
                             {
-                                string line = _serialPort.ReadLine();
-                                if (!string.IsNullOrWhiteSpace(line))
+                                // ReadExisting() returns immediately with whatever
+                                // is already buffered. The previous ReadLine() call
+                                // could block for up to ReadTimeout (1s) waiting on
+                                // a '\n' while holding this same semaphore that the
+                                // audio (~20Hz) and timing (~1Hz) senders also need -
+                                // a partial/missing line from the Arduino could stall
+                                // those for a full second at a time.
+                                string chunk = _serialPort.ReadExisting();
+                                _arduinoLineBuffer += chunk;
+
+                                int newlineIndex;
+                                while ((newlineIndex = _arduinoLineBuffer.IndexOf('\n')) >= 0)
                                 {
-                                    _logger.LogInformation($"[ARDUINO] {line}");
+                                    string line = _arduinoLineBuffer.Substring(0, newlineIndex).TrimEnd('\r');
+                                    _arduinoLineBuffer = _arduinoLineBuffer.Substring(newlineIndex + 1);
+                                    if (!string.IsNullOrWhiteSpace(line))
+                                    {
+                                        _logger.LogInformation($"[ARDUINO] {line}");
+                                    }
                                 }
-                            }
-                            catch (TimeoutException)
-                            {
-                                // Normal timeout, just continue
                             }
                             catch (Exception ex)
                             {
@@ -689,12 +722,12 @@ AudioUpdateIntervalMs=50
             }
         }
 
-        private async Task<SongData?> GetCurrentSongDataAsync()
+        private async Task<SongData?> GetCurrentSongDataAsync(bool includeThumbnail)
         {
             try
             {
-                var sessionManager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-                var currentSession = sessionManager.GetCurrentSession();
+                _sessionManager ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+                var currentSession = _sessionManager.GetCurrentSession();
 
                 if (currentSession == null) return null;
 
@@ -746,7 +779,7 @@ AudioUpdateIntervalMs=50
                 string artist = (mediaProperties.Artist ?? "Unknown Artist").Replace("|", "").Trim();
 
                 byte[]? thumbnailBytes = null;
-                if (mediaProperties.Thumbnail != null)
+                if (includeThumbnail && mediaProperties.Thumbnail != null)
                 {
                     thumbnailBytes = await GetAndConvertThumbnailAsync(mediaProperties.Thumbnail);
                 }
@@ -759,12 +792,17 @@ AudioUpdateIntervalMs=50
                     Position = (int)effectivePosition.TotalSeconds,
                     Source = sourceApp,
                     IsPlaying = isPlaying,
-                    Thumbnail = thumbnailBytes ?? CreateTestThumbnail()
+                    Thumbnail = includeThumbnail ? (thumbnailBytes ?? CreateTestThumbnail()) : null
                 };
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Error getting song data");
+                // The cached manager might itself be the stale/broken part
+                // (e.g. the media session service restarted) - drop it so
+                // the next poll re-acquires a fresh one instead of repeating
+                // the same failure forever.
+                _sessionManager = null;
                 return null;
             }
         }

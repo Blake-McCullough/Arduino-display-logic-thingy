@@ -174,6 +174,14 @@ namespace MusicToArduino
         private const double PeakDecay = 0.985;
         private const double PeakFloor = 1e-5;
 
+        // Scratch space for ComputeBands, reused across calls instead of
+        // allocating two small arrays on every call (~86 times/second across
+        // both channels) purely to add GC pressure to the audio callback
+        // thread. Safe to share between the left/right calls because each
+        // call finishes reading/writing these before ComputeBands returns.
+        private readonly double[] _bandTotals = new double[7];
+        private readonly int[] _bandCounts = new int[7];
+
         private byte[] ComputeBands(float[] samples, int sampleRate, double[] bandPeaks)
         {
             for (int i = 0; i < FftLength; i++)
@@ -185,8 +193,10 @@ namespace MusicToArduino
 
             FastFourierTransform.FFT(true, _fftPower, _fftBuffer);
 
-            var bandTotals = new double[7];
-            var bandCounts = new int[7];
+            var bandTotals = _bandTotals;
+            var bandCounts = _bandCounts;
+            Array.Clear(bandTotals, 0, bandTotals.Length);
+            Array.Clear(bandCounts, 0, bandCounts.Length);
 
             // Only the first half of the spectrum is meaningful (Nyquist).
             for (int i = 1; i < FftLength / 2; i++)
